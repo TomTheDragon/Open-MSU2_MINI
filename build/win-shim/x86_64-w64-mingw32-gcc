@@ -1,0 +1,5 @@
+#!/bin/sh
+# wxdragon-sys asks the MinGW gcc for its libgcc folder. Zig ships its own C/C++
+# runtime, so there is none: answer "unknown" (wxdragon then skips that search path).
+[ "$1" = "-print-libgcc-file-name" ] && exit 1
+exec zig cc -target x86_64-windows-gnu "$@"

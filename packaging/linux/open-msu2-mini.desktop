@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Open MSU2_MINI
+Comment=Control the MSU2 / MSU2_MINI USB screen
+Exec=@BIN@ gui
+Icon=open-msu2-mini
+Categories=Utility;System;
+Terminal=false
