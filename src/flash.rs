@@ -1,6 +1,6 @@
 //! Store pictures in the device's flash (they stay there without a PC).
 
-use crate::device::{canvas_size, orient, Device, Frame565, FLASH_ALBUM, FLASH_ANIMATION, FLASH_CLOCK_BG};
+use crate::device::{canvas_size, orient, Device, Frame565, FLASH_ANIMATION, FLASH_IMAGE};
 use crate::render::load_frames;
 use crate::scale::{frame_bytes, Scaling};
 use anyhow::{bail, Result};
@@ -77,24 +77,15 @@ fn natural_key(s: &str) -> Vec<(u8, u64, String)> {
     out
 }
 
-pub fn write_album(
+/// The still picture the device shows by itself (see `FLASH_IMAGE`).
+pub fn write_image(
     dev: &mut Device,
     path: &Path,
     fit: Scaling,
     rotation: u16,
     progress: impl FnMut(usize, usize),
 ) -> Result<()> {
-    dev.write_flash(FLASH_ALBUM, &frame_bytes(&single(path, fit, rotation)?), progress)
-}
-
-pub fn write_clock_background(
-    dev: &mut Device,
-    path: &Path,
-    fit: Scaling,
-    rotation: u16,
-    progress: impl FnMut(usize, usize),
-) -> Result<()> {
-    dev.write_flash(FLASH_CLOCK_BG, &frame_bytes(&single(path, fit, rotation)?), progress)
+    dev.write_flash(FLASH_IMAGE, &frame_bytes(&single(path, fit, rotation)?), progress)
 }
 
 pub fn write_animation(

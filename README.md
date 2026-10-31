@@ -10,16 +10,19 @@ It replaces the vendor's Windows-only demo tool and runs on **Linux, Windows and
   temperatures, RAM, swap, disk space and speed, network, battery, load, processes, uptime and
   time. Each with a bar, a history graph (histogram) or no graphic, the number before,
   behind or on top of it, in any order, with pages when they don't fit on one screen.
-- **Clock** and **pictures / animated GIFs**.
+- **Clock**, **pictures** and **animated GIFs**.
+- **Brightness** from 10 % to 100 % (the picture is darkened: the MSU2_MINI's firmware has
+  no backlight control, see [Protocol](#protocol)).
 - **Videos**, optionally with sound (on the computer's speakers, in sync with the picture)
-  and in a loop. Decoded by [ffmpeg](https://ffmpeg.org): on Linux the system's package
-  (every format it knows); on Windows and macOS MP4/MOV with H.264 plays out of the box,
-  other formats (WebM, MKV, AVI, HEVC, ...) need ffmpeg installed.
-- **Writes to the device's flash**: what the device shows by itself while no PC is
-  connected (a picture, or a 36-frame animation from a GIF), and the album picture.
+  and in a loop. Decoded by [ffmpeg](https://ffmpeg.org), every format it knows (Linux:
+  the system's package; Windows: `winget install Gyan.FFmpeg`). On macOS MP4/MOV with
+  H.264 plays without it, other formats (WebM, MKV, AVI, HEVC, ...) need ffmpeg installed.
+- **Two slots on the device**: Slot1 holds an image, Slot2 an image or a GIF. Without a PC
+  the device shows Slot2 by itself, and its button switches to Slot1.
 - **Rotation by 0°, 90°, 180° or 270°.** At 90° and 270° the screen can stand upright; the
   system monitor and the clock then use portrait layouts.
-- The **button on the device** cycles through the modes.
+- The **button on the device** cycles through all modes (Image, GIF and Video once a file is
+  chosen for them).
 - **Native window** that follows your desktop theme: GTK on Linux, Win32 with dark mode on
   Windows, Cocoa on macOS. Optionally with an icon in the notification area (system tray)
   and started minimized.
@@ -44,7 +47,7 @@ Download the executable for your system from the
 | System | Notes |
 |---|---|
 | **Linux** x86_64 | Packages for Ubuntu/Debian, Fedora/openSUSE and Arch, or a single executable; see [Linux](#linux) below. |
-| **Windows** 10/11 | Just run the `.exe`; no driver needed. Videos in formats other than MP4/H.264 need [ffmpeg](https://ffmpeg.org) (in PATH or next to the `.exe`). |
+| **Windows** 10/11 | Just run the `.exe`; no driver needed. For videos install [ffmpeg](https://ffmpeg.org): `winget install Gyan.FFmpeg` (or put `ffmpeg.exe` next to the program). |
 | **macOS** | Allow "Screen Recording" for the app (or your terminal) to mirror the screen. Videos in formats other than MP4/H.264 need ffmpeg (`brew install ffmpeg`). |
 
 ### Linux
@@ -67,6 +70,11 @@ if it was connected during the installation).
 | **Fedora** 41+ | `.rpm` | `sudo dnf install ./open-msu2-mini-*.x86_64.rpm ffmpeg-free` |
 | **openSUSE** Tumbleweed | `.rpm` (the same file) | `sudo zypper install --allow-unsigned-rpm ./open-msu2-mini-*.x86_64.rpm` |
 | **Arch**, Manjaro, EndeavourOS | `.pkg.tar.zst` | `sudo pacman -U open-msu2-mini-*.pkg.tar.zst && sudo pacman -S --needed ffmpeg` |
+| Any other (glibc 2.39+) | `.AppImage` | `chmod +x open-msu2-mini-*-x86_64.AppImage`, then start it |
+
+The **AppImage** brings the tray-icon libraries and libSM along, and uses GTK 3, PipeWire,
+ALSA and ffmpeg from the system. It does not install the udev rule; see *Device access*
+below.
 
 **Single executable.** Alternatively download `open-msu2-mini-linux-x86_64` and install the
 libraries yourself (most are already there on a desktop system):
@@ -81,7 +89,7 @@ libraries yourself (most are already there on a desktop system):
 Then `chmod +x open-msu2-mini-linux-x86_64` and run it, or install it for your user with
 `packaging/linux/install.sh [--udev] [--autostart]` from a copy of this repository: it
 copies the program to `~/.local/bin`, adds an app-menu entry and optionally autostart and
-the udev rule, and reports missing libraries. Without the udev rule, add yourself to the
+the udev rule, and reports missing libraries. **Device access:** without the udev rule (packages install it), add yourself to the
 group that owns serial ports and log in again: `sudo usermod -aG dialout $USER` (Arch:
 `uucp` instead of `dialout`).
 
@@ -98,7 +106,8 @@ Start the program without arguments to open the window. On the command line:
 ```sh
 open-msu2-mini                          # window
 open-msu2-mini run                      # no window, saved settings (for autostart)
-open-msu2-mini run stats                # modes: mirror stats clock image video album animation
+open-msu2-mini run stats                # modes: mirror stats clock image gif video slot1 slot2
+open-msu2-mini run --gif cat.gif --brightness 50   # GIF mode at half brightness
 open-msu2-mini run --video clip.mp4 --sound --loop=false   # play once, with sound
 open-msu2-mini run mirror --region 0,0,1280,640 --fps 60
 open-msu2-mini run stats --rotate 90    # rotation: 0, 90, 180 or 270 (works with run/show/flash)
@@ -106,8 +115,8 @@ open-msu2-mini run mirror --fps 0.5     # slowest: one picture every two seconds
 open-msu2-mini run mirror --monitor 1   # Windows/macOS: mirror the second monitor
 open-msu2-mini run mirror --reselect    # Linux: choose the shared screen/window again
 open-msu2-mini show cat.gif             # show a picture or GIF
-open-msu2-mini flash animation clip.gif # shown without PC: a GIF, a picture, or a folder A0.png ... A35.png
-open-msu2-mini flash album photo.jpg    # album picture (shown in the album mode, while the program runs)
+open-msu2-mini flash slot2 clip.gif     # Slot2 on the device: a GIF, a picture, or a folder A0.png ... A35.png
+open-msu2-mini flash slot1 photo.jpg    # Slot1 on the device: a picture
 open-msu2-mini test                     # test pattern
 open-msu2-mini sysinfo                  # print what the system monitor reads on this computer
 open-msu2-mini bench --mirror           # measure the frame rate
@@ -127,8 +136,11 @@ open-msu2-mini --help
 
 - **System monitor:** choose the values, their order and the look under *System monitor →
   Customize…* in the window (or edit the `stats` section of the settings file).
-- **Rotation:** pictures stored on the device (album, offline animation) are turned when they are
-  written, so write them again after switching between landscape and portrait.
+- **Slots on the device:** *Upload Slot1 (image)…* and *Upload Slot2 (image or GIF)…* keep
+  a picture and a picture or GIF in the device's flash; the modes *Slot1 on device* and
+  *Slot2 on device* show them. Without a PC the device shows Slot2, and its button switches
+  to Slot1. Brightness does not affect them, and they are turned when they are written, so
+  upload them again after switching between landscape and portrait.
 - **System monitor values:** `open-msu2-mini sysinfo` prints every value as this computer
   reports it (no device needed); please include its output when reporting wrong values. On
   Windows, temperatures are usually not available: Windows reports them only to programs
@@ -202,6 +214,7 @@ Windows is cross-compiled with Zig):
 ```sh
 build/build-all.sh   # dist/: Linux and Windows executables, .deb, .rpm and Arch package
 build/package.sh     # only the packages, from dist/open-msu2-mini-linux-x86_64 (nfpm, packaging/linux/nfpm.yaml)
+MSU2_APPIMAGE=1 build/package.sh   # also the AppImage (downloads appimagetool; CI always builds it)
 ```
 
 GitHub Actions (`.github/workflows/ci.yml`) builds Linux, Windows and macOS (Intel and
@@ -216,7 +229,7 @@ Apple Silicon) on every push. A `v*` tag publishes the executables as a release.
 | `src/capture/` | Screen capture (portal + PipeWire on Linux, xcap on Windows/macOS) |
 | `src/stats.rs` | System monitor |
 | `src/render.rs`, `src/scale.rs` | Clock, pictures, text; scaling to the panel or a portrait canvas |
-| `src/video.rs`, `src/audio.rs` | Video playback and its sound: ffmpeg (Linux; Windows/macOS: OpenH264 and Symphonia, ffmpeg for other formats), output with cpal |
+| `src/video.rs`, `src/audio.rs` | Video playback and its sound: ffmpeg (Linux, Windows; macOS: OpenH264 and Symphonia, ffmpeg for other formats), output with cpal |
 | `src/gui.rs`, `src/gui_stats.rs` | Window and system monitor settings (wxWidgets) |
 | `src/main.rs` | Command line, benchmark |
 | `build/` | Docker build environment and scripts |
@@ -241,6 +254,7 @@ The baud rate is ignored. Every command is 6 bytes. Pixels are RGB565, big-endia
 | `02 03 00 ph pl 00` | Show a picture stored in flash at page `p` |
 | `02 03 01 ph pl 00` | Show a 1-bit picture from flash in the set colours |
 | `02 03 0A rr 00 00` | Orientation (0 = normal, 1 = rotated 180°) |
+| `02 03 12 dh dl 00` | Backlight PWM `d` = 0–1000 on the MSU2 PRO; the MSU2_MINI ignores it (see below) |
 | `02 03 0B ch cl 00` | Fill the rectangle with a colour |
 | `03 00 a2 a1 a0 00` | Read the flash byte at address `a`; the reply's last byte is the value |
 | `03 02 ph pl nh nl` | Erase `n` flash pages starting at page `p` |
@@ -253,8 +267,18 @@ Further notes:
 - Without traffic for about 5 seconds, the device returns to offline mode and announces
   itself again.
 - Flash: P25D80, 1 MB, 4096 pages of 256 bytes. Stock layout (pages): `0–3599` offline
-  animation (36 × 100), `3651` 32×64 ASCII font, `3826` clock background, `3926` album
-  picture, `4026+` digit glyphs.
+  animation (36 × 100), `3651` 32×64 ASCII font, `3820` boot logo (1-bit, 160×68), `3826`
+  offline still picture, `3926` "album" picture of the vendor demo (not shown by the firmware
+  itself), `4026+` digit glyphs.
+- **No backlight control on the MSU2_MINI:** neither the PRO's `02 03 12` nor any other
+  unused display command (`02 03 0C`–`1F`, `02 05`–`0F`, each with all-`00` and all-`FF`
+  values) changes the brightness, and the V1.0 firmware drives no PWM for the backlight.
+  The app therefore darkens the picture instead. `open-msu2-mini probe-backlight` (hidden)
+  repeats this test with the test number shown on the screen, for other firmware versions.
+- Offline, the firmware shows the entries of a directory at address `0x0FFE00` (32 bytes
+  each: flags, frame interval, frame count, start page, size): the animation at page 0 and
+  the still picture at page 3826; the device's button switches between them. Thanks to
+  [kxn/msu2-ip-display](https://github.com/kxn/msu2-ip-display) for the firmware analysis.
 
 ## License
 

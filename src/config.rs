@@ -11,23 +11,27 @@ pub enum Mode {
     Stats,
     Clock,
     Image,
+    Gif,
     Video,
+    /// The still picture stored on the device
     Album,
+    /// The 36-frame animation stored on the device
     Animation,
 }
 
 impl Mode {
-    pub const ALL: [Mode; 7] =
-        [Mode::Mirror, Mode::Stats, Mode::Clock, Mode::Image, Mode::Video, Mode::Album, Mode::Animation];
+    pub const ALL: [Mode; 8] =
+        [Mode::Mirror, Mode::Stats, Mode::Clock, Mode::Image, Mode::Gif, Mode::Video, Mode::Album, Mode::Animation];
     pub fn label(self) -> &'static str {
         match self {
             Mode::Mirror => "Screen mirror",
             Mode::Stats => "System monitor",
             Mode::Clock => "Clock",
-            Mode::Image => "Image / GIF",
+            Mode::Image => "Image",
+            Mode::Gif => "GIF",
             Mode::Video => "Video",
-            Mode::Album => "Album (stored on device)",
-            Mode::Animation => "Animation (stored on device)",
+            Mode::Album => "Slot1 on device (image)",
+            Mode::Animation => "Slot2 on device (image or GIF)",
         }
     }
 }
@@ -36,6 +40,7 @@ impl Mode {
 #[serde(default)]
 pub struct Config {
     pub mode: Mode,
+    /// Modes the device's button cycles through; empty = all
     pub button_modes: Vec<Mode>,
     /// Picture rotation: 0, 90, 180 or 270 degrees (clockwise)
     pub rotation: u16,
@@ -52,6 +57,10 @@ pub struct Config {
     pub image: Option<PathBuf>,
     /// Video for the video mode
     pub video: Option<PathBuf>,
+    /// Animated GIF (or WebP / APNG) for the GIF mode
+    pub gif: Option<PathBuf>,
+    /// Screen brightness in percent (10..=100)
+    pub brightness: u8,
     /// Play the video's sound
     pub video_sound: bool,
     /// Start the video again at the end (otherwise its last picture stays)
@@ -69,7 +78,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             mode: Mode::Mirror,
-            button_modes: vec![Mode::Mirror, Mode::Stats, Mode::Clock, Mode::Album, Mode::Animation],
+            button_modes: Vec::new(),
             rotation: 0,
             flipped: false,
             fit: Scaling::Crop,
@@ -79,6 +88,8 @@ impl Default for Config {
             max_fps: 60.0,
             image: None,
             video: None,
+            gif: None,
+            brightness: 100,
             video_sound: false,
             video_loop: true,
             clock_background: None,
@@ -89,6 +100,9 @@ impl Default for Config {
         }
     }
 }
+
+/// Lowest brightness setting (percent), so the screen never goes completely dark
+pub const MIN_BRIGHTNESS: u8 = 10;
 
 pub fn normalize_rotation(r: u16) -> u16 {
     ((r as u32 % 360) / 90 * 90) as u16
@@ -411,6 +425,19 @@ impl Config {
         c.rotation = normalize_rotation(c.rotation);
         c.max_fps = c.max_fps.clamp(0.1, 1000.0);
         c.stats.migrate();
+        c.brightness = c.brightness.clamp(MIN_BRIGHTNESS, 100);
+        // the old default list left out Image and Video: use all modes instead
+        if c.button_modes == [Mode::Mirror, Mode::Stats, Mode::Clock, Mode::Album, Mode::Animation] {
+            c.button_modes.clear();
+        }
+        // before 1.1.2 one mode showed pictures and GIFs: move a GIF to the new GIF mode
+        let is_gif = |p: &PathBuf| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("gif"));
+        if c.gif.is_none() && c.image.as_ref().is_some_and(is_gif) {
+            c.gif = c.image.take();
+            if c.mode == Mode::Image {
+                c.mode = Mode::Gif;
+            }
+        }
         c
     }
 

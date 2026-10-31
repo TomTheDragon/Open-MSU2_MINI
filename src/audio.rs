@@ -1,8 +1,8 @@
 //! Sound for the video mode: decodes a video's soundtrack and plays it on the default
 //! output device. It also serves as the video's clock, so picture and sound stay together.
 //!
-//! Linux: the soundtrack is decoded by ffmpeg (the system's package).
-//! Windows / macOS: decoded inside the program (Symphonia: AAC, MP3, FLAC, Vorbis, PCM in
+//! Linux / Windows: the soundtrack is decoded by ffmpeg.
+//! macOS: decoded inside the program (Symphonia: AAC, MP3, FLAC, Vorbis, PCM in
 //! MP4/MOV, MKV/WebM, OGG, WAV); other formats are handed to ffmpeg, if it is installed.
 
 use anyhow::{anyhow, Context, Result};
@@ -128,7 +128,7 @@ fn run(shared: &Arc<Shared>, path: &Path) -> Result<()> {
                 backend = Some(b);
                 s
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(target_os = "macos")]
             Some(Backend::Builtin) => Source::Builtin(Box::new(Builtin::open(path)?)),
             Some(Backend::Ffmpeg(ref ff)) => Source::Ffmpeg(Ffmpeg::start(ff, path, rate)?),
         };
@@ -304,13 +304,13 @@ impl Resampler {
 // -- sources -----------------------------------------------------------------------------
 
 enum Backend {
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     Builtin,
     Ffmpeg(PathBuf),
 }
 
 enum Source {
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     Builtin(Box<Builtin>),
     Ffmpeg(Ffmpeg),
 }
@@ -319,22 +319,22 @@ impl Source {
     /// Next piece of sound (interleaved) and its sample rate and channel count; None at the end.
     fn next_chunk(&mut self, buf: &mut Vec<f32>) -> Result<Option<(u32, usize)>> {
         match self {
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(target_os = "macos")]
             Source::Builtin(b) => b.next_chunk(buf),
             Source::Ffmpeg(f) => f.next_chunk(buf),
         }
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(not(target_os = "macos"))]
 fn open_source(path: &Path, rate: u32) -> Result<(Source, Backend)> {
     let ffmpeg =
-        crate::video::find_ffmpeg().ok_or_else(|| anyhow!("sound needs ffmpeg; install the ffmpeg package"))?;
+        crate::video::find_ffmpeg().ok_or_else(|| anyhow!("sound needs ffmpeg; {}", crate::video::INSTALL_FFMPEG))?;
     let f = Ffmpeg::start(&ffmpeg, path, rate)?;
     Ok((Source::Ffmpeg(f), Backend::Ffmpeg(ffmpeg)))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 fn open_source(path: &Path, rate: u32) -> Result<(Source, Backend)> {
     match Builtin::open(path) {
         Ok(b) => Ok((Source::Builtin(Box::new(b)), Backend::Builtin)),
@@ -349,28 +349,28 @@ fn open_source(path: &Path, rate: u32) -> Result<(Source, Backend)> {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 #[derive(Debug)]
 struct NoSoundtrack;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 impl std::fmt::Display for NoSoundtrack {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.write_str("the video has no sound")
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 impl std::error::Error for NoSoundtrack {}
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 struct Builtin {
     format: Box<dyn symphonia::core::formats::FormatReader>,
     decoder: Box<dyn symphonia::core::codecs::audio::AudioDecoder>,
     track: u32,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 impl Builtin {
     fn open(path: &Path) -> Result<Self> {
         use symphonia::core::formats::probe::Hint;

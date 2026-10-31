@@ -3,7 +3,7 @@
 use crate::capture::{Capture, CaptureOptions};
 use crate::config::{Config, Mode};
 use crate::device::{canvas_size, hw_flip, orient};
-use crate::device::{Device, Frame565, FLASH_ALBUM, FLASH_ANIMATION, FRAME_PAGES};
+use crate::device::{Device, Frame565, FLASH_ANIMATION, FLASH_IMAGE, FRAME_PAGES};
 use crate::render::{self, ClockScreen, ImageScreen, Screen};
 use crate::stats::StatsScreen;
 use crate::video::{Playback, VideoScreen};
@@ -97,6 +97,7 @@ pub fn spawn(cfg: Config, use_button: bool, on_status: impl Fn(&Status) + Send +
         next_poll: Instant::now(),
         anim_frame: 0,
         meter: Meter::default(),
+        dimmer: None,
     };
     let thread = std::thread::Builder::new().name("controller".into()).spawn(move || c.run()).unwrap();
     Handle { cfg, status, changed, reselect, stop, jobs: tx, thread: Some(thread) }
@@ -134,6 +135,49 @@ struct Controller {
     next_poll: Instant,
     anim_frame: u32,
     meter: Meter,
+    /// Software brightness (None = full brightness)
+    dimmer: Option<Dimmer>,
+}
+
+/// Darkens pictures before they are sent: the panel has no brightness control the
+/// firmware exposes, so dimming means darker colours (black stays black).
+struct Dimmer {
+    percent: u8,
+    /// RGB565 channel lookup: 5-bit red/blue and 6-bit green values scaled down
+    lut5: [u16; 32],
+    lut6: [u16; 64],
+}
+
+impl Dimmer {
+    fn new(percent: u8) -> Self {
+        let f = percent as f32 / 100.0;
+        Dimmer {
+            percent,
+            lut5: std::array::from_fn(|v| (v as f32 * f).round() as u16),
+            lut6: std::array::from_fn(|v| (v as f32 * f).round() as u16),
+        }
+    }
+
+    fn apply(&self, frame: &mut [u16]) {
+        for p in frame {
+            let (r, g, b) = (*p >> 11, (*p >> 5) & 63, *p & 31);
+            *p = (self.lut5[r as usize] << 11) | (self.lut6[g as usize] << 5) | self.lut5[b as usize];
+        }
+    }
+}
+
+/// The mode after the current one in the button's cycle: all modes (or the configured
+/// list), without Image, GIF and Video while no file is chosen for them.
+fn next_button_mode(cfg: &Config) -> Mode {
+    let seq: Vec<Mode> = if cfg.button_modes.is_empty() { Mode::ALL.to_vec() } else { cfg.button_modes.clone() };
+    let usable = |m: &Mode| match m {
+        Mode::Image => cfg.image.is_some(),
+        Mode::Gif => cfg.gif.is_some(),
+        Mode::Video => cfg.video.is_some(),
+        _ => true,
+    };
+    let start = seq.iter().position(|m| *m == cfg.mode).map_or(0, |i| i + 1);
+    (0..seq.len()).map(|k| seq[(start + k) % seq.len()]).find(usable).unwrap_or(cfg.mode)
 }
 
 const BUTTON_POLL: Duration = Duration::from_millis(200);
@@ -234,6 +278,10 @@ impl Controller {
             self.flipped = Some(flip);
             self.shown = None;
         }
+        if self.dimmer.as_ref().map_or(100, |d| d.percent) != cfg.brightness {
+            self.dimmer = (cfg.brightness < 100).then(|| Dimmer::new(cfg.brightness));
+            self.shown = None;
+        }
         self.mode = cfg.mode;
         self.screen = None;
         self.meter = Meter::default();
@@ -249,14 +297,17 @@ impl Controller {
         match self.mode {
             Mode::Stats => self.screen = Some(Box::new(StatsScreen::new(cfg.stats.clone(), size))),
             Mode::Clock => self.screen = Some(Box::new(ClockScreen::new(cfg.clock_background.as_deref(), size))),
-            Mode::Image => match cfg.image.as_deref().map(|p| ImageScreen::new(p, cfg.fit, size)) {
-                Some(Ok(s)) => self.screen = Some(Box::new(s)),
-                Some(Err(e)) => {
-                    self.set_status(|s| s.text = format!("{e:#}"));
-                    self.show(render::message(&["Cannot open", "the image"], [255, 120, 120], size))?;
+            Mode::Image | Mode::Gif => {
+                let (file, what) = if self.mode == Mode::Image { (&cfg.image, "image") } else { (&cfg.gif, "GIF") };
+                match file.as_deref().map(|p| ImageScreen::new(p, cfg.fit, size)) {
+                    Some(Ok(s)) => self.screen = Some(Box::new(s)),
+                    Some(Err(e)) => {
+                        self.set_status(|s| s.text = format!("{e:#}"));
+                        self.show(render::message(&["Cannot open", &format!("the {what}")], [255, 120, 120], size))?;
+                    }
+                    None => self.show(render::message(&[&format!("No {what} selected")], [255, 255, 255], size))?,
                 }
-                None => self.show(render::message(&["No image selected"], [255, 255, 255], size))?,
-            },
+            }
             Mode::Video => match cfg.video.as_deref().map(|p| {
                 VideoScreen::new(p, cfg.fit, size, Playback { sound: cfg.video_sound, looping: cfg.video_loop })
             }) {
@@ -268,7 +319,7 @@ impl Controller {
                 None => self.show(render::message(&["No video selected"], [255, 255, 255], size))?,
             },
             Mode::Album => {
-                self.dev.as_mut().unwrap().show_flash_image(FLASH_ALBUM)?;
+                self.dev.as_mut().unwrap().show_flash_image(FLASH_IMAGE)?;
                 self.shown = None;
             }
             Mode::Animation => self.anim_frame = 0,
@@ -310,7 +361,10 @@ impl Controller {
     }
 
     /// Draw a canvas (see `device::canvas_size`), sending only what changed.
-    fn show(&mut self, canvas: Frame565) -> anyhow::Result<()> {
+    fn show(&mut self, mut canvas: Frame565) -> anyhow::Result<()> {
+        if let Some(dim) = &self.dimmer {
+            dim.apply(&mut canvas);
+        }
         let frame = orient(&canvas, self.rotation);
         let dev = self.dev.as_mut().unwrap();
         let before = dev.stats.bytes;
@@ -402,16 +456,31 @@ impl Controller {
         } else if self.key_down {
             self.key_down = false;
             let mut cfg = self.cfg.lock().unwrap();
-            let seq = if cfg.button_modes.is_empty() { Mode::ALL.to_vec() } else { cfg.button_modes.clone() };
-            let next = match seq.iter().position(|m| *m == cfg.mode) {
-                Some(i) => seq[(i + 1) % seq.len()],
-                None => seq[0],
-            };
+            let next = next_button_mode(&cfg);
             cfg.mode = next;
             cfg.save();
             drop(cfg);
             self.changed.store(true, Ordering::SeqCst);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn button_cycles_all_modes_with_a_file() {
+        let mut cfg = Config { mode: Mode::Clock, ..Default::default() };
+        // no files: Image, GIF and Video are skipped
+        assert_eq!(next_button_mode(&cfg), Mode::Album);
+        cfg.image = Some("a.png".into());
+        cfg.video = Some("v.mp4".into());
+        assert_eq!(next_button_mode(&cfg), Mode::Image);
+        cfg.mode = Mode::Image;
+        assert_eq!(next_button_mode(&cfg), Mode::Video);
+        cfg.mode = Mode::Animation;
+        assert_eq!(next_button_mode(&cfg), Mode::Mirror);
     }
 }

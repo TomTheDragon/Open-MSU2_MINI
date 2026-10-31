@@ -1,9 +1,8 @@
 //! Video playback: plays a video file on the screen, optionally with sound and in a loop.
 //!
-//! Linux: decoded by ffmpeg (the system's package, any format it knows).
-//! Windows / macOS: MP4/MOV files with H.264 video (what phones and most websites produce)
-//! are decoded inside the program (OpenH264); everything else is handed to ffmpeg, if it is
-//! installed (in PATH or next to this program).
+//! Linux / Windows: decoded by ffmpeg (any format it knows; in PATH or next to this program).
+//! macOS: MP4/MOV files with H.264 video (what phones and most websites produce) are decoded
+//! inside the program (OpenH264); everything else is handed to ffmpeg, if it is installed.
 //!
 //! Every frame carries its time in the video; it is shown when the playback clock gets
 //! there, and skipped when the device falls behind. With sound, the sound card is the clock.
@@ -21,6 +20,13 @@ use std::time::{Duration, Instant};
 
 /// File types offered in the file dialog.
 pub const EXTENSIONS: [&str; 9] = ["mp4", "m4v", "mov", "mkv", "webm", "avi", "wmv", "mpg", "mpeg"];
+
+/// How to install ffmpeg, for error messages
+pub const INSTALL_FFMPEG: &str = if cfg!(windows) {
+    "install it with \"winget install Gyan.FFmpeg\" (or put ffmpeg.exe next to this program)"
+} else {
+    "install the ffmpeg package"
+};
 
 /// ffmpeg output rate (the panel shows about 25 full frames per second at most)
 const FFMPEG_FPS: u32 = 30;
@@ -64,13 +70,12 @@ impl VideoScreen {
     pub fn new(path: &Path, fit: Scaling, size: Size, playback: Playback) -> Result<Self> {
         let (tx, rx) = sync_channel::<Msg>(4);
         let looping = playback.looping;
-        #[cfg(target_os = "linux")]
+        #[cfg(not(target_os = "macos"))]
         {
-            let ffmpeg =
-                find_ffmpeg().ok_or_else(|| anyhow::anyhow!("videos need ffmpeg; install the ffmpeg package"))?;
+            let ffmpeg = find_ffmpeg().ok_or_else(|| anyhow::anyhow!("videos need ffmpeg; {INSTALL_FFMPEG}"))?;
             start_ffmpeg_decoder(ffmpeg, path, fit, size, looping, tx)?;
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
         match builtin::Mp4Source::open(path) {
             Ok(src) => {
                 std::thread::Builder::new()
@@ -190,9 +195,9 @@ impl Screen for VideoScreen {
     }
 }
 
-// -- built-in: MP4/MOV + H.264 (Windows / macOS) ------------------------------------------
+// -- built-in: MP4/MOV + H.264 (macOS) -----------------------------------------------------
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 mod builtin {
     use super::{Msg, Size};
     use crate::scale::{Order, Scaler, Scaling};
@@ -349,7 +354,12 @@ fn start_ffmpeg_decoder(
 pub(crate) fn find_ffmpeg() -> Option<PathBuf> {
     let name = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
     let beside = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join(name)));
-    let candidates = beside.into_iter().filter(|p| p.is_file()).chain([PathBuf::from(name)]);
+    // Windows: where "winget install Gyan.FFmpeg" links it (in PATH only for programs
+    // started after the installation)
+    let winget = std::env::var_os("LOCALAPPDATA")
+        .filter(|_| cfg!(windows))
+        .map(|d| PathBuf::from(d).join(r"Microsoft\WinGet\Links").join(name));
+    let candidates = beside.into_iter().chain(winget).filter(|p| p.is_file()).chain([PathBuf::from(name)]);
     for c in candidates {
         let mut cmd = Command::new(&c);
         cmd.arg("-version").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());

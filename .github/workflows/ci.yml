@@ -31,7 +31,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build clang libclang-dev pkg-config libgtk-3-dev \
-            libpipewire-0.3-dev libayatana-appindicator3-dev libudev-dev libasound2-dev libxkbcommon-dev libgl1-mesa-dev libglu1-mesa-dev libssl-dev
+            libpipewire-0.3-dev libayatana-appindicator3-dev libudev-dev libasound2-dev libsm6 libice6 file libxkbcommon-dev libgl1-mesa-dev libglu1-mesa-dev libssl-dev
       - name: macOS packages
         if: runner.os == 'macOS'
         run: brew install cmake ninja
@@ -50,7 +50,7 @@ jobs:
         with:
           name: ${{ matrix.asset }}
           path: ${{ matrix.asset }}
-      - name: Linux packages (deb, rpm, Arch)
+      - name: Linux packages (deb, rpm, Arch, AppImage)
         if: runner.os == 'Linux'
         run: build/package.sh ${{ matrix.asset }}
       - uses: actions/upload-artifact@v4
@@ -61,6 +61,7 @@ jobs:
             dist/*.deb
             dist/*.rpm
             dist/*.pkg.tar.zst
+            dist/*.AppImage
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')

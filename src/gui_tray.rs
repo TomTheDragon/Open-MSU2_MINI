@@ -64,7 +64,7 @@ impl Tray {
         }
         // (Re)setting the icon also hands AppIndicator a fresh copy of the menu.
         if let Some(b) = &self.bitmap {
-            self.icon.set_icon_bundle(b, "Open MSU2_MINI");
+            self.icon.set_icon_bundle(b, crate::APP_TITLE);
         }
     }
 

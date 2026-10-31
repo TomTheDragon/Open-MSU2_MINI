@@ -15,6 +15,7 @@ mod gui;
 mod gui_stats;
 #[cfg(feature = "gui")]
 mod gui_tray;
+mod probe;
 mod render;
 mod scale;
 mod stats;
@@ -27,6 +28,9 @@ use device::{Device, Frame565, HEIGHT, WIDTH};
 use scale::Scaling;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+/// Name and version, shown in the window title and the tray icon's tooltip
+pub const APP_TITLE: &str = concat!("Open MSU2_MINI ", env!("CARGO_PKG_VERSION"));
 
 #[derive(Parser)]
 #[command(
@@ -51,9 +55,14 @@ enum ModeArg {
     Stats,
     Clock,
     Image,
+    Gif,
     Video,
-    Album,
-    Animation,
+    /// Slot1 on the device (image)
+    #[value(name = "slot1", alias = "device-image", alias = "album")]
+    DeviceImage,
+    /// Slot2 on the device (image or GIF)
+    #[value(name = "slot2", alias = "device-gif", alias = "animation")]
+    DeviceGif,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -75,9 +84,12 @@ impl From<FitArg> for Scaling {
 
 #[derive(Clone, Copy, ValueEnum)]
 enum FlashWhat {
-    Album,
-    ClockBackground,
-    Animation,
+    /// Slot1: a picture (offline, the device's button switches to it)
+    #[value(name = "slot1", alias = "image", alias = "album", alias = "clock-background")]
+    Image,
+    /// Slot2: a GIF, a picture or a folder of pictures (shown offline)
+    #[value(name = "slot2", alias = "gif", alias = "animation")]
+    Gif,
 }
 
 #[derive(Subcommand)]
@@ -104,9 +116,15 @@ enum Cmd {
         /// Upper limit for frames per second, e.g. 0.5, 20 or 60
         #[arg(long)]
         fps: Option<f32>,
-        /// Picture or GIF for the image mode
+        /// Picture for the image mode
         #[arg(long)]
         image: Option<PathBuf>,
+        /// Animated GIF for the GIF mode
+        #[arg(long)]
+        gif: Option<PathBuf>,
+        /// Brightness in percent (10-100)
+        #[arg(long, value_parser = clap::value_parser!(u8).range(10..=100))]
+        brightness: Option<u8>,
         /// Video for the video mode
         #[arg(long)]
         video: Option<PathBuf>,
@@ -138,14 +156,31 @@ enum Cmd {
     /// Store pictures permanently on the device
     Flash {
         what: FlashWhat,
-        /// Picture (album, clock-background), or picture / GIF / folder of pictures (animation:
-        /// what the device shows by itself without a PC; a single picture stays still)
+        /// Picture (slot1), or GIF / picture / folder of pictures (slot2)
         source: PathBuf,
         #[arg(long, default_value = "crop")]
         fit: FitArg,
     },
     /// Print what the system monitor reads on this computer (no device needed)
     Sysinfo,
+    /// Test: try unused display commands to find a backlight control (watch the screen)
+    #[command(hide = true)]
+    ProbeBacklight {
+        /// Start at this test number
+        #[arg(long, default_value_t = 1)]
+        from: usize,
+        /// Stop after this test number
+        #[arg(long)]
+        to: Option<usize>,
+    },
+    /// Test: print flash bytes in hex (address and length, e.g. 0xFFE00 128)
+    #[command(hide = true)]
+    ReadFlash {
+        #[arg(value_parser = parse_number)]
+        addr: u32,
+        #[arg(value_parser = parse_number)]
+        len: u32,
+    },
     /// Measure the frame rate with different kinds of content
     Bench {
         /// Seconds per test
@@ -209,6 +244,8 @@ fn run(cli: Cli) -> Result<()> {
             monitor,
             fps,
             image,
+            gif,
+            brightness,
             video,
             sound,
             looping,
@@ -226,9 +263,10 @@ fn run(cli: Cli) -> Result<()> {
                     ModeArg::Stats => Mode::Stats,
                     ModeArg::Clock => Mode::Clock,
                     ModeArg::Image => Mode::Image,
+                    ModeArg::Gif => Mode::Gif,
                     ModeArg::Video => Mode::Video,
-                    ModeArg::Album => Mode::Album,
-                    ModeArg::Animation => Mode::Animation,
+                    ModeArg::DeviceImage => Mode::Album,
+                    ModeArg::DeviceGif => Mode::Animation,
                 };
             }
             if let Some(f) = fit {
@@ -251,6 +289,15 @@ fn run(cli: Cli) -> Result<()> {
                 if mode.is_none() {
                     cfg.mode = Mode::Image;
                 }
+            }
+            if let Some(g) = gif {
+                cfg.gif = Some(std::fs::canonicalize(&g).unwrap_or(g));
+                if mode.is_none() {
+                    cfg.mode = Mode::Gif;
+                }
+            }
+            if let Some(b) = brightness {
+                cfg.brightness = b;
             }
             if let Some(v) = video {
                 cfg.video = Some(std::fs::canonicalize(&v).unwrap_or(v));
@@ -341,15 +388,21 @@ fn run(cli: Cli) -> Result<()> {
                 }
             };
             match what {
-                FlashWhat::Album => flash::write_album(&mut d, &source, fit.into(), saved_rotation(), progress)?,
-                FlashWhat::ClockBackground => {
-                    flash::write_clock_background(&mut d, &source, fit.into(), saved_rotation(), progress)?
-                }
-                FlashWhat::Animation => {
-                    flash::write_animation(&mut d, &source, fit.into(), saved_rotation(), progress)?
-                }
+                FlashWhat::Image => flash::write_image(&mut d, &source, fit.into(), saved_rotation(), progress)?,
+                FlashWhat::Gif => flash::write_animation(&mut d, &source, fit.into(), saved_rotation(), progress)?,
             }
             println!("Done in {:.1} s.", t.elapsed().as_secs_f64());
+            Ok(())
+        }
+        Cmd::ProbeBacklight { from, to } => probe::run(cli.port.as_deref(), from, to),
+        Cmd::ReadFlash { addr, len } => {
+            let mut d = Device::open(cli.port.as_deref())?;
+            for row in (addr..addr + len).step_by(16) {
+                let bytes: Vec<String> = (row..(row + 16).min(addr + len))
+                    .map(|a| d.read_flash_byte(a).map(|b| format!("{b:02x}")))
+                    .collect::<Result<_>>()?;
+                println!("{row:06x}: {}", bytes.join(" "));
+            }
             Ok(())
         }
         Cmd::Sysinfo => {
@@ -511,4 +564,12 @@ fn bench(port: Option<&str>, secs: f64, mirror: bool) -> Result<()> {
 
 fn s_render(s: &mut dyn render::Screen) -> Frame565 {
     s.render().0
+}
+
+fn parse_number(s: &str) -> std::result::Result<u32, String> {
+    match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(hex) => u32::from_str_radix(hex, 16),
+        None => s.parse(),
+    }
+    .map_err(|e| e.to_string())
 }

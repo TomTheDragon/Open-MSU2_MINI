@@ -1,7 +1,7 @@
 //! Control window. Uses wxWidgets, i.e. the platform's own controls and theme:
 //! GTK on Linux, Win32 (incl. dark mode) on Windows, Cocoa on macOS.
 
-use crate::config::{self, fps_class, fps_label, Config, Mode, TrayIcon, FPS_CHOICES};
+use crate::config::{self, fps_class, fps_label, Config, Mode, TrayIcon, FPS_CHOICES, MIN_BRIGHTNESS};
 use crate::controller;
 use crate::flash;
 use crate::gui_tray::{self, Action, Tray};
@@ -15,6 +15,7 @@ use wxdragon::prelude::*;
 
 const IMAGE_WILDCARD: &str =
     "Pictures (*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp)|*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp|All files|*";
+const ANIM_WILDCARD: &str = "Animations (*.gif;*.webp;*.png)|*.gif;*.webp;*.png|All files|*";
 const ROTATIONS: [u16; 4] = [0, 90, 180, 270];
 
 fn file_name(p: &Option<PathBuf>) -> String {
@@ -55,7 +56,7 @@ pub fn run(port: Option<String>) -> Result<()> {
 fn build(cfg: Config, resume_background: bool) {
     let handle = Rc::new(RefCell::new(controller::spawn(cfg.clone(), true, |_| {})));
 
-    let frame = Frame::builder().with_title("Open MSU2_MINI").build();
+    let frame = Frame::builder().with_title(crate::APP_TITLE).build();
     if let Some(icon) =
         BitmapBundle::from_svg_text(gui_tray::ICON_SVG, Size::new(64, 64)).and_then(|b| b.get_bitmap(Size::new(64, 64)))
     {
@@ -166,6 +167,31 @@ fn build(cfg: Config, resume_background: bool) {
     grid.add(&fps_note, 0, cv, 0);
     grid.add(&label(""), 0, cv, 0);
 
+    // brightness
+    let levels: Vec<u8> = (MIN_BRIGHTNESS..=100).rev().step_by(10).collect();
+    let bright = Choice::builder(&op).with_choices(levels.iter().map(|l| format!("{l}%")).collect()).build();
+    bright.set_selection(levels.iter().position(|l| *l <= cfg.brightness).unwrap_or(0) as u32);
+    bright.set_tooltip(
+        "Darkens everything this program shows. The pictures stored on the device\n\
+         (shown without PC) keep their full brightness.",
+    );
+    {
+        let h = handle.clone();
+        bright.on_selection_changed(move |e| {
+            if let Some(i) = e.get_selection() {
+                let v = levels[i as usize];
+                h.borrow().update(|c| c.brightness = v);
+            }
+        });
+    }
+    let bright_row = BoxSizer::builder(Orientation::Horizontal).build();
+    bright_row.add(&bright, 0, cv, 0);
+    let bright_note = StaticText::builder(&op).with_label("Slot1 / Slot2 on the device are not affected.").build();
+    bright_row.add(&bright_note, 0, cv | SizerFlag::Left, 10);
+    grid.add(&label("Brightness:"), 0, cv, 0);
+    grid.add_sizer(&bright_row, 0, cv, 0);
+    grid.add(&label(""), 0, cv, 0);
+
     // system monitor
     let stats_btn = Button::builder(&op).with_label("Customize...").build();
     {
@@ -256,7 +282,7 @@ fn build(cfg: Config, resume_background: bool) {
     {
         let (h, f, name, radios2) = (handle.clone(), frame, image_name, radios.clone());
         image_btn.on_click(move |_| {
-            if let Some(p) = pick_file(&f, "Choose a picture or GIF") {
+            if let Some(p) = pick_file(&f, "Choose a picture") {
                 name.set_label(&file_name(&Some(p.clone())));
                 h.borrow().update(|c| {
                     c.image = Some(p);
@@ -268,14 +294,37 @@ fn build(cfg: Config, resume_background: bool) {
             }
         });
     }
-    grid.add(&label("Image / GIF:"), 0, cv, 0);
+    grid.add(&label("Image:"), 0, cv, 0);
     grid.add(&image_name, 0, cv, 0);
     grid.add(&image_btn, 0, cv, 0);
+
+    let gif_name = StaticText::builder(&op).with_label(&file_name(&cfg.gif)).build();
+    let gif_btn = Button::builder(&op).with_label("Choose...").build();
+    {
+        let (h, f, name, radios2) = (handle.clone(), frame, gif_name, radios.clone());
+        gif_btn.on_click(move |_| {
+            if let Some(p) = pick(&f, "Choose an animated GIF", ANIM_WILDCARD) {
+                name.set_label(&file_name(&Some(p.clone())));
+                h.borrow().update(|c| {
+                    c.gif = Some(p);
+                    c.mode = Mode::Gif;
+                });
+                for (m, rb) in &radios2 {
+                    rb.set_value(*m == Mode::Gif);
+                }
+            }
+        });
+    }
+    grid.add(&label("GIF:"), 0, cv, 0);
+    grid.add(&gif_name, 0, cv, 0);
+    grid.add(&gif_btn, 0, cv, 0);
 
     let video_name = StaticText::builder(&op).with_label(&file_name(&cfg.video)).build();
     let video_btn = Button::builder(&op).with_label("Choose...").build();
     video_btn.set_tooltip(if cfg!(target_os = "linux") {
         "Videos are decoded by ffmpeg (install the ffmpeg package)."
+    } else if cfg!(windows) {
+        "Videos are decoded by ffmpeg: install it with\n\"winget install Gyan.FFmpeg\" or put ffmpeg.exe next to this program."
     } else {
         "MP4/MOV with H.264 works directly; other formats\n\
          (WebM, MKV, AVI, HEVC, ...) need ffmpeg installed."
@@ -385,20 +434,20 @@ fn build(cfg: Config, resume_background: bool) {
             .build();
     let fp = fl_box.get_static_box().unwrap();
     let fl_row = BoxSizer::builder(Orientation::Horizontal).build();
-    let album_btn = Button::builder(&fp).with_label("Album picture...").build();
-    album_btn.set_tooltip(
-        "Shown in the \"Album\" mode, i.e. while this program runs.\n\
-         For a picture the device shows on its own, use \"Without PC\".",
-    );
-    let anim_btn = Button::builder(&fp).with_label("Without PC: picture or GIF...").build();
+    let album_btn = Button::builder(&fp).with_label("Upload Slot1 (image)...").build();
+    album_btn.set_tooltip("A still picture, kept on the device (mode \"Slot1 on device\").");
+    let anim_btn = Button::builder(&fp).with_label("Upload Slot2 (image or GIF)...").build();
     anim_btn.set_tooltip(
-        "What the device shows by itself while no PC is connected (also the \"Animation\" mode):\n\
-         a picture, an animated GIF (36 frames are taken from it) or a folder of pictures.",
+        "A picture or an animated GIF, kept on the device as 36 frames (mode \"Slot2 on device\").\n\
+         For a folder of pictures (A0.png ... A35.png) use: open-msu2-mini flash slot2 FOLDER",
     );
     fl_row.add(&album_btn, 0, SizerFlag::Right, 8);
     fl_row.add(&anim_btn, 0, SizerFlag::Right, 0);
+    let fl_note =
+        StaticText::builder(&fp).with_label("Without PC the device shows Slot2; its button switches to Slot1.").build();
     let gauge = Gauge::builder(&fp).with_range(100).build();
     fl_box.add_sizer(&fl_row, 0, SizerFlag::All, 6);
+    fl_box.add(&fl_note, 0, SizerFlag::Left | SizerFlag::Right | SizerFlag::Bottom, 6);
     fl_box.add(&gauge, 0, SizerFlag::Expand | SizerFlag::Left | SizerFlag::Right | SizerFlag::Bottom, 6);
     root.add_sizer(&fl_box, 0, SizerFlag::Expand | SizerFlag::Left | SizerFlag::Right | SizerFlag::Top, pad);
 
@@ -410,27 +459,9 @@ fn build(cfg: Config, resume_background: bool) {
                 return;
             }
             let src = if animation {
-                let gif = MessageDialog::builder(
-                    &f,
-                    "Use a picture or an animated GIF?\n\n(No = choose a folder of pictures, e.g. A0.png ... A35.png)",
-                    "Shown without PC",
-                )
-                .with_style(MessageDialogStyle::YesNo | MessageDialogStyle::IconQuestion)
-                .build()
-                .show_modal()
-                    == ID_YES;
-                if gif {
-                    pick_file(&f, "Choose a picture or animated GIF to show without PC")
-                } else {
-                    let d = DirDialog::builder(&f, "Choose a folder of pictures", "").build();
-                    if d.show_modal() == ID_OK {
-                        d.get_path().map(PathBuf::from)
-                    } else {
-                        None
-                    }
-                }
+                pick(&f, "Choose a picture or animated GIF for Slot2", IMAGE_WILDCARD)
             } else {
-                pick_file(&f, "Choose the album picture (shown in the Album mode)")
+                pick_file(&f, "Choose a picture for Slot1")
             };
             let Some(src) = src else { return };
             let (fit, rotation) = {
@@ -449,7 +480,7 @@ fn build(cfg: Config, resume_background: bool) {
                     if animation {
                         flash::write_animation(dev, &src, fit, rotation, progress)
                     } else {
-                        flash::write_album(dev, &src, fit, rotation, progress)
+                        flash::write_image(dev, &src, fit, rotation, progress)
                     }
                 }),
                 Box::new(move |r| st2.lock().unwrap().result = Some(r.map_err(|e| format!("{e:#}")))),
@@ -464,7 +495,12 @@ fn build(cfg: Config, resume_background: bool) {
     }
 
     let tip = StaticText::builder(&panel).with_label("Tip: the button on the device cycles through the modes.").build();
-    root.add(&tip, 0, SizerFlag::All, pad);
+    let version = StaticText::builder(&panel).with_label(concat!("Version ", env!("CARGO_PKG_VERSION"))).build();
+    version.set_tooltip(crate::APP_TITLE);
+    let bottom = BoxSizer::builder(Orientation::Horizontal).build();
+    bottom.add(&tip, 1, SizerFlag::AlignCenterVertical, 0);
+    bottom.add(&version, 0, SizerFlag::AlignCenterVertical | SizerFlag::Left, 12);
+    root.add_sizer(&bottom, 0, SizerFlag::Expand | SizerFlag::All, pad);
 
     panel.set_sizer(root, true);
     let outer = BoxSizer::builder(Orientation::Vertical).build();
@@ -542,7 +578,7 @@ fn build(cfg: Config, resume_background: bool) {
             }
             let r = if s.connected
                 && s.fps > 0.0
-                && matches!(s.mode, Mode::Mirror | Mode::Animation | Mode::Image | Mode::Video)
+                && matches!(s.mode, Mode::Mirror | Mode::Animation | Mode::Image | Mode::Gif | Mode::Video)
             {
                 format!("{:.0} fps · {:.0} KB/s", s.fps, s.kbps)
             } else {

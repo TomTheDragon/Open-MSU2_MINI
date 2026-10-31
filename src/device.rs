@@ -15,8 +15,10 @@ pub const USB_PID: u16 = 0xFE0C;
 
 /// Flash layout used by the stock firmware (1 page = 256 bytes).
 pub const FLASH_ANIMATION: u32 = 0; // 36 frames x 100 pages, played when no PC is connected
-pub const FLASH_CLOCK_BG: u32 = 3826;
-pub const FLASH_ALBUM: u32 = 3926;
+/// Still picture the device shows by itself while no PC is connected; its button switches
+/// between this and the animation (the vendor demo used this page as clock background).
+pub const FLASH_IMAGE: u32 = 3826;
+// Page 3926 is the vendor demo's "album" picture; the firmware never shows it by itself.
 pub const FRAME_PAGES: u32 = (WIDTH * HEIGHT * 2 / 256) as u32; // 100
 
 /// A frame in device format: RGB565, one u16 per pixel, row-major.
@@ -157,13 +159,22 @@ impl Device {
                 }
             }
         }
-        self.port.clear(serialport::ClearBuffer::Input).ok();
-        self.port.write_all(b"\0MSNCN")?;
-        let reply = self.read_for(Duration::from_millis(300), 6)?;
-        if find(&reply, b"\0MSNCN").is_none() {
-            bail!("unexpected handshake reply {:02x?}", reply);
+        // The echo can come after more offline announcements ("\0MSNvv"): skip those, and
+        // ask again a few times.
+        let mut reply = Vec::new();
+        for _ in 0..3 {
+            self.port.clear(serialport::ClearBuffer::Input).ok();
+            self.port.write_all(b"\0MSNCN")?;
+            let deadline = Instant::now() + Duration::from_millis(400);
+            reply.clear();
+            while Instant::now() < deadline {
+                reply.extend(self.read_available()?);
+                if find(&reply, b"\0MSNCN").is_some() {
+                    return Ok(());
+                }
+            }
         }
-        Ok(())
+        bail!("unexpected handshake reply {:02x?}", &reply[..reply.len().min(24)])
     }
 
     fn read_available(&mut self) -> Result<Vec<u8>> {
@@ -181,15 +192,6 @@ impl Device {
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Ok(Vec::new()),
             Err(e) => Err(e.into()),
         }
-    }
-
-    fn read_for(&mut self, timeout: Duration, want: usize) -> Result<Vec<u8>> {
-        let deadline = Instant::now() + timeout;
-        let mut buf = Vec::new();
-        while Instant::now() < deadline && buf.len() < want {
-            buf.extend(self.read_available()?);
-        }
-        Ok(buf)
     }
 
     /// Wait for a 6-byte reply whose first byte is `kind`, skipping LCD acks.
@@ -240,6 +242,13 @@ impl Device {
     /// Rotate the picture by 180 degrees.
     pub fn set_flipped(&mut self, flipped: bool) -> Result<()> {
         self.cmd([2, 3, 10, flipped as u8, 0, 0]);
+        self.flush()
+    }
+
+    /// Send any 6-byte command (protocol experiments, see `probe`).
+    pub fn raw_command(&mut self, b: [u8; 6]) -> Result<()> {
+        self.cmd(b);
+        self.block = None;
         self.flush()
     }
 
@@ -347,6 +356,15 @@ impl Device {
     }
 
     // -- flash ------------------------------------------------------------------
+    /// Read one flash byte (slow: one command per byte).
+    pub fn read_flash_byte(&mut self, addr: u32) -> Result<u8> {
+        self.flush()?;
+        self.drain();
+        self.cmd([3, 0, (addr >> 16) as u8, (addr >> 8) as u8, addr as u8, 0]);
+        self.flush()?;
+        Ok(self.reply(3, Duration::from_secs(1)).context("flash read")?[5])
+    }
+
     pub fn erase_flash(&mut self, page: u32, count: u32) -> Result<()> {
         self.flush()?;
         self.drain();

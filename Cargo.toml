@@ -1,6 +1,6 @@
 [package]
 name = "open-msu2-mini"
-version = "1.1.1"
+version = "1.1.2"
 edition = "2021"
 description = "Open-source driver and control app for the MSU2 / MSU2_MINI 160x80 USB screen"
 license = "MIT"
@@ -42,7 +42,9 @@ windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_Sys
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 xcap = "0.9"
-# video mode (Linux uses the system's ffmpeg instead): MP4 container, H.264 and sound decoders
+
+# video mode on macOS (Linux and Windows use ffmpeg): MP4 container, H.264 and sound decoders
+[target.'cfg(target_os = "macos")'.dependencies]
 mp4 = "0.14"
 openh264 = "0.9"
 symphonia = { version = "0.6", default-features = false, features = ["aac", "isomp4", "mp3", "pcm", "flac", "vorbis", "mkv", "wav", "ogg", "adpcm"] }
