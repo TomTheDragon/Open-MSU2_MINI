@@ -8,21 +8,29 @@ It replaces the vendor's Windows-only demo tool and runs on **Linux, Windows and
   a whole monitor, a window, or a part of the screen.
 - **Customisable system monitor** with 17 values: CPU, per-core load, clock speed, GPU, VRAM,
   temperatures, RAM, swap, disk space and speed, network, battery, load, processes, uptime and
-  time. Shown as bars, history graphs or plain numbers, in any order, with pages when they
-  don't fit on one screen.
+  time. Each with a bar, a history graph (histogram) or no graphic, the number before,
+  behind or on top of it, in any order, with pages when they don't fit on one screen.
 - **Clock** and **pictures / animated GIFs**.
+- **Videos**, optionally with sound (on the computer's speakers, in sync with the picture)
+  and in a loop. MP4/MOV with H.264 plays out of the box; other formats (WebM, MKV, AVI,
+  HEVC, ...) use [ffmpeg](https://ffmpeg.org) if it is installed.
 - **Writes to the device's flash**: the album picture, and the 36-frame animation it plays
   while no PC is connected.
 - **Rotation by 0°, 90°, 180° or 270°.** At 90° and 270° the screen can stand upright; the
   system monitor and the clock then use portrait layouts.
 - The **button on the device** cycles through the modes.
 - **Native window** that follows your desktop theme: GTK on Linux, Win32 with dark mode on
-  Windows, Cocoa on macOS.
+  Windows, Cocoa on macOS. Optionally with an icon in the notification area (system tray)
+  and started minimized.
 - **Command line** for running without a window (autostart), flashing and benchmarking.
 
 ![System monitor (bars and history graphs) and clock in landscape](docs/screens-landscape.png)
 
 ![System monitor and clock in portrait, for an upright screen (90°/270° rotation)](docs/screens-portrait.png)
+
+![The control window (KDE Plasma, dark theme)](docs/window-main.png)
+
+![System monitor settings: values, graphic, value position and colours](docs/window-system-monitor.png)
 
 > Not affiliated with the hardware's manufacturer. The USB protocol was worked out from the
 > behaviour of the vendor's tool; see [Protocol](#protocol).
@@ -34,7 +42,7 @@ Download the executable for your system from the
 
 | System | Notes |
 |---|---|
-| **Linux** x86_64 | Needs glibc 2.39+ (distributions from 2024 on), GTK 3 and PipeWire. Your user must be in the `dialout` group: `sudo usermod -aG dialout $USER`, then log in again. `packaging/linux/install.sh` adds the program, an app-menu entry and optional autostart. |
+| **Linux** x86_64 | Needs glibc 2.39+ (distributions from 2024 on), GTK 3, PipeWire, ALSA (libasound, for video sound) and libayatana-appindicator3 (for the tray icon). Your user must be in the `dialout` group: `sudo usermod -aG dialout $USER`, then log in again. `packaging/linux/install.sh` adds the program, an app-menu entry and optional autostart. |
 | **Windows** 10/11 | Just run the `.exe`; no driver needed. |
 | **macOS** | Allow "Screen Recording" for the app (or your terminal) to mirror the screen. |
 
@@ -45,7 +53,8 @@ Start the program without arguments to open the window. On the command line:
 ```sh
 open-msu2-mini                          # window
 open-msu2-mini run                      # no window, saved settings (for autostart)
-open-msu2-mini run stats                # modes: mirror stats clock image album animation
+open-msu2-mini run stats                # modes: mirror stats clock image video album animation
+open-msu2-mini run --video clip.mp4 --sound --loop=false   # play once, with sound
 open-msu2-mini run mirror --region 0,0,1280,640 --fps 60
 open-msu2-mini run stats --rotate 90    # rotation: 0, 90, 180 or 270 (works with run/show/flash)
 open-msu2-mini run mirror --fps 0.5     # slowest: one picture every two seconds
@@ -76,6 +85,10 @@ open-msu2-mini --help
   written, so write them again after switching between landscape and portrait.
 - **Scaling:** the panel is 2:1. `crop` fills it and cuts off the edges, `fit` adds black
   bars, `stretch` distorts.
+- **Window icon:** under *Window icon in* choose the taskbar, the notification area or both.
+  With the notification area only, the minimized window leaves the taskbar; click the icon
+  (or use its menu) to bring it back. *Start minimized* opens the window minimized, or only
+  as the icon. On GNOME the tray needs the "AppIndicator" extension.
 - **Settings:** stored in `~/.config/open-msu2-mini/` (Linux), `%APPDATA%\open-msu2-mini\`
   (Windows) or `~/Library/Application Support/open-msu2-mini/` (macOS).
 - **Window and background instance:** if `open-msu2-mini run` is running in the background,
@@ -116,8 +129,8 @@ You need Rust (1.95+), CMake and a C++ compiler. wxWidgets is downloaded and com
 automatically on the first build, which takes a few minutes.
 
 - **Linux:** additionally `clang`, and the development packages for GTK 3, PipeWire,
-  libudev and OpenSSL (`apt install libclang-dev libgtk-3-dev libpipewire-0.3-dev
-  libudev-dev libssl-dev`).
+  Ayatana AppIndicator, libudev, ALSA and OpenSSL (`apt install libclang-dev libgtk-3-dev
+  libpipewire-0.3-dev libayatana-appindicator3-dev libudev-dev libasound2-dev libssl-dev`).
 - **Windows:** Visual Studio Build Tools and Ninja; build from a "Developer PowerShell".
 - **macOS:** Xcode command line tools, plus `brew install cmake ninja`.
 
@@ -145,6 +158,7 @@ Apple Silicon) on every push. A `v*` tag publishes the executables as a release.
 | `src/capture/` | Screen capture (portal + PipeWire on Linux, xcap on Windows/macOS) |
 | `src/stats.rs` | System monitor |
 | `src/render.rs`, `src/scale.rs` | Clock, pictures, text; scaling to the panel or a portrait canvas |
+| `src/video.rs`, `src/audio.rs` | Video playback (OpenH264 or ffmpeg) and its sound (Symphonia, cpal) |
 | `src/gui.rs`, `src/gui_stats.rs` | Window and system monitor settings (wxWidgets) |
 | `src/main.rs` | Command line, benchmark |
 | `build/` | Docker build environment and scripts |

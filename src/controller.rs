@@ -6,6 +6,7 @@ use crate::device::{canvas_size, hw_flip, orient};
 use crate::device::{Device, Frame565, FLASH_ALBUM, FLASH_ANIMATION, FRAME_PAGES};
 use crate::render::{self, ClockScreen, ImageScreen, Screen};
 use crate::stats::StatsScreen;
+use crate::video::{Playback, VideoScreen};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -255,6 +256,16 @@ impl Controller {
                     self.show(render::message(&["Cannot open", "the image"], [255, 120, 120], size))?;
                 }
                 None => self.show(render::message(&["No image selected"], [255, 255, 255], size))?,
+            },
+            Mode::Video => match cfg.video.as_deref().map(|p| {
+                VideoScreen::new(p, cfg.fit, size, Playback { sound: cfg.video_sound, looping: cfg.video_loop })
+            }) {
+                Some(Ok(s)) => self.screen = Some(Box::new(s)),
+                Some(Err(e)) => {
+                    self.set_status(|s| s.text = format!("{e:#}"));
+                    self.show(render::message(&["Cannot play", "the video"], [255, 120, 120], size))?;
+                }
+                None => self.show(render::message(&["No video selected"], [255, 255, 255], size))?,
             },
             Mode::Album => {
                 self.dev.as_mut().unwrap().show_flash_image(FLASH_ALBUM)?;

@@ -7,7 +7,7 @@ use crate::device::{Frame565, HEIGHT, WIDTH};
 use crate::scale::{rgb_to_565, Scaler, Scaling};
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use anyhow::{Context, Result};
-use image::{AnimationDecoder, Rgb, RgbImage};
+use image::{AnimationDecoder, GrayImage, Luma, Rgb, RgbImage};
 use imageproc::drawing::{draw_filled_rect_mut, draw_hollow_rect_mut, draw_text_mut, text_size};
 use imageproc::rect::Rect;
 use std::path::Path;
@@ -63,8 +63,8 @@ pub fn text_width(s: &str, size: f32, font: &FontRef) -> i32 {
     text_size(PxScale::from(size), font, s).0 as i32
 }
 
-/// Draw text with its vertical centre at `cy`.
-pub fn text(img: &mut RgbImage, s: &str, x: i32, cy: i32, st: Style) {
+/// Top-left corner for drawing `s` so that its vertical centre is at `cy`.
+fn text_origin(s: &str, x: i32, cy: i32, st: &Style) -> (i32, i32) {
     let scale = PxScale::from(st.size);
     let w = text_size(scale, st.font, s).0 as i32;
     let x = match st.anchor {
@@ -75,13 +75,43 @@ pub fn text(img: &mut RgbImage, s: &str, x: i32, cy: i32, st: Style) {
     // centre on the height of digits/capitals, independent of the characters used
     let sf = st.font.as_scaled(scale);
     let cap = sf.ascent() * 0.72;
-    let y = cy - (sf.ascent() - cap / 2.0).round() as i32;
+    (x, cy - (sf.ascent() - cap / 2.0).round() as i32)
+}
+
+/// Draw text with its vertical centre at `cy`.
+pub fn text(img: &mut RgbImage, s: &str, x: i32, cy: i32, st: Style) {
+    let scale = PxScale::from(st.size);
+    let (x, y) = text_origin(s, x, cy, &st);
     if st.outline {
         for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, 1), (-1, 1), (1, -1)] {
             draw_text_mut(img, Rgb([0, 0, 0]), x + dx, y + dy, scale, st.font, s);
         }
     }
     draw_text_mut(img, Rgb(st.color), x, y, scale, st.font, s);
+}
+
+/// Draw text over a picture: every pixel of the text gets the opposite colour of what is
+/// underneath it, and the text gets a 1-pixel black outline. `st.color` is not used.
+pub fn text_inverted(img: &mut RgbImage, s: &str, x: i32, cy: i32, st: Style) {
+    let (w, h) = img.dimensions();
+    let (x, y) = text_origin(s, x, cy, &st);
+    let mut mask = GrayImage::new(w, h);
+    draw_text_mut(&mut mask, Luma([255]), x, y, PxScale::from(st.size), st.font, s);
+    let covered = |px: i32, py: i32| {
+        px >= 0 && py >= 0 && (px as u32) < w && (py as u32) < h && mask.get_pixel(px as u32, py as u32).0[0] > 0
+    };
+    for py in 0..h as i32 {
+        for px in 0..w as i32 {
+            let a = mask.get_pixel(px as u32, py as u32).0[0] as u32;
+            let near = a > 0 || (-1..=1).any(|dy| (-1..=1).any(|dx| covered(px + dx, py + dy)));
+            if !near {
+                continue;
+            }
+            // inverted colour, blended over the black outline by the glyph's coverage
+            let p = img.get_pixel_mut(px as u32, py as u32);
+            p.0 = p.0.map(|c| ((255 - c as u32) * a / 255) as u8);
+        }
+    }
 }
 
 pub fn blank(size: Size) -> RgbImage {

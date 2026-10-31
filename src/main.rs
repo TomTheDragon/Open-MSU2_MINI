@@ -3,6 +3,7 @@
 // Some helpers are only used by the window; keep the window-less build warning-free.
 #![cfg_attr(not(feature = "gui"), allow(dead_code))]
 
+mod audio;
 mod capture;
 mod config;
 mod controller;
@@ -12,9 +13,12 @@ mod flash;
 mod gui;
 #[cfg(feature = "gui")]
 mod gui_stats;
+#[cfg(feature = "gui")]
+mod gui_tray;
 mod render;
 mod scale;
 mod stats;
+mod video;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -47,6 +51,7 @@ enum ModeArg {
     Stats,
     Clock,
     Image,
+    Video,
     Album,
     Animation,
 }
@@ -102,6 +107,15 @@ enum Cmd {
         /// Picture or GIF for the image mode
         #[arg(long)]
         image: Option<PathBuf>,
+        /// Video for the video mode
+        #[arg(long)]
+        video: Option<PathBuf>,
+        /// Play the video's sound (--sound=false to turn it off)
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        sound: Option<bool>,
+        /// Start the video again at the end (--loop=false: play once, keep the last picture)
+        #[arg(long = "loop", num_args = 0..=1, default_missing_value = "true")]
+        looping: Option<bool>,
         #[arg(long)]
         clock_background: Option<PathBuf>,
         /// Ignore the push button on the device
@@ -183,7 +197,22 @@ fn run(cli: Cli) -> Result<()> {
             #[cfg(not(feature = "gui"))]
             anyhow::bail!("this build has no window; use `open-msu2-mini run`");
         }
-        Cmd::Run { mode, fit, region, full, reselect, monitor, fps, image, clock_background, no_button, save } => {
+        Cmd::Run {
+            mode,
+            fit,
+            region,
+            full,
+            reselect,
+            monitor,
+            fps,
+            image,
+            video,
+            sound,
+            looping,
+            clock_background,
+            no_button,
+            save,
+        } => {
             let mut cfg = Config::load();
             if let Some(p) = cli.port {
                 cfg.port = Some(p);
@@ -194,6 +223,7 @@ fn run(cli: Cli) -> Result<()> {
                     ModeArg::Stats => Mode::Stats,
                     ModeArg::Clock => Mode::Clock,
                     ModeArg::Image => Mode::Image,
+                    ModeArg::Video => Mode::Video,
                     ModeArg::Album => Mode::Album,
                     ModeArg::Animation => Mode::Animation,
                 };
@@ -218,6 +248,18 @@ fn run(cli: Cli) -> Result<()> {
                 if mode.is_none() {
                     cfg.mode = Mode::Image;
                 }
+            }
+            if let Some(v) = video {
+                cfg.video = Some(std::fs::canonicalize(&v).unwrap_or(v));
+                if mode.is_none() {
+                    cfg.mode = Mode::Video;
+                }
+            }
+            if let Some(s) = sound {
+                cfg.video_sound = s;
+            }
+            if let Some(l) = looping {
+                cfg.video_loop = l;
             }
             if let Some(b) = clock_background {
                 cfg.clock_background = Some(std::fs::canonicalize(&b).unwrap_or(b));

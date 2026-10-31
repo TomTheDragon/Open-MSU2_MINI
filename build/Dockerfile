@@ -4,7 +4,7 @@ FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl xz-utils git build-essential cmake ninja-build pkg-config \
-      clang libclang-dev libgtk-3-dev libpipewire-0.3-dev libudev-dev libxkbcommon-dev \
+      clang libclang-dev libgtk-3-dev libpipewire-0.3-dev libayatana-appindicator3-dev libudev-dev libasound2-dev libxkbcommon-dev \
       libgl1-mesa-dev libglu1-mesa-dev libexpat1-dev libpng-dev libdbus-1-dev libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:/opt/zig:$PATH

@@ -1,8 +1,8 @@
 //! Customisable system monitor.
 
-use crate::config::{StatItem, StatStyle, StatsConfig};
+use crate::config::{StatGraphic, StatItem, StatsConfig, ValuePosition};
 use crate::device::Frame565;
-use crate::render::{blank, bold, regular, text, text_width, Anchor, Screen, Size, Style};
+use crate::render::{blank, bold, regular, text, text_inverted, text_width, Anchor, Screen, Size, Style};
 use crate::scale::rgb_to_565;
 use image::{Rgb, RgbImage};
 use imageproc::drawing::{draw_filled_rect_mut, draw_hollow_rect_mut};
@@ -295,7 +295,12 @@ impl StatsScreen {
         }
     }
 
-    /// Bar, graph or core bars inside `area` (x, y, w, h).
+    /// Whether this row gets a graphic
+    fn has_viz(&self, row: &Row) -> bool {
+        self.cfg.graphic != StatGraphic::None && (row.frac.is_some() || row.multi.is_some())
+    }
+
+    /// Bar, histogram or core bars inside `area` (x, y, w, h).
     fn draw_viz(&self, img: &mut RgbImage, row: &Row, area: (i32, i32, i32, i32)) {
         let (x, y, w, h) = area;
         if w < 4 || h < 2 {
@@ -319,33 +324,79 @@ impl StatsScreen {
             return;
         }
         let Some(frac) = row.frac else { return };
-        match self.cfg.style {
-            StatStyle::Text => {}
-            StatStyle::Bars => {
-                draw_hollow_rect_mut(img, Rect::at(x, y).of_size(w as u32, h as u32), Rgb([70, 70, 70]));
-                let fill = ((w - 2) as f32 * frac.clamp(0.0, 1.0)) as u32;
-                if fill > 0 && h > 2 {
-                    draw_filled_rect_mut(
-                        img,
-                        Rect::at(x + 1, y + 1).of_size(fill, (h - 2) as u32),
-                        Rgb(self.color(frac)),
-                    );
+        // inner area: inside the outline, if there is one
+        let (ix, iy, iw, ih) = if self.cfg.outline && h > 2 { (x + 1, y + 1, w - 2, h - 2) } else { (x, y, w, h) };
+        match self.cfg.graphic {
+            StatGraphic::None => {}
+            StatGraphic::Bars => {
+                let fill = (iw as f32 * frac.clamp(0.0, 1.0)) as u32;
+                if fill > 0 {
+                    draw_filled_rect_mut(img, Rect::at(ix, iy).of_size(fill, ih as u32), Rgb(self.color(frac)));
                 }
             }
-            StatStyle::Graphs => {
+            StatGraphic::Histogram => {
                 draw_filled_rect_mut(img, Rect::at(x, y).of_size(w as u32, h as u32), Rgb([25, 25, 30]));
                 if let Some(hist) = self.history.get(&row.item) {
-                    let skip = hist.len().saturating_sub(w as usize);
-                    let start = x + w - (hist.len() - skip) as i32;
+                    let skip = hist.len().saturating_sub(iw as usize);
+                    let start = ix + iw - (hist.len() - skip) as i32;
                     for (i, v) in hist.iter().skip(skip).enumerate() {
-                        let bh = ((h as f32) * v).round().max(1.0) as i32;
+                        let bh = ((ih as f32) * v).round().max(1.0) as i32;
                         draw_filled_rect_mut(
                             img,
-                            Rect::at(start + i as i32, y + h - bh).of_size(1, bh as u32),
+                            Rect::at(start + i as i32, iy + ih - bh).of_size(1, bh as u32),
                             Rgb(self.color(*v)),
                         );
                     }
                 }
+            }
+        }
+        if self.cfg.outline {
+            draw_hollow_rect_mut(img, Rect::at(x, y).of_size(w as u32, h as u32), Rgb([70, 70, 70]));
+        }
+    }
+
+    /// Graphic and value of one row, between `x0` and `x1`, vertically centred on `cy`.
+    /// `tall` is the height for histograms and for values drawn on top, `bar` the height
+    /// of a plain bar.
+    fn draw_body(
+        &self,
+        img: &mut RgbImage,
+        row: &Row,
+        (x0, x1): (i32, i32),
+        cy: i32,
+        (tall, bar): (i32, i32),
+        fs: f32,
+    ) {
+        let pos = self.cfg.value_position;
+        let white = |size: f32| Style::new(size, regular(), [230, 230, 230]);
+        if !self.has_viz(row) {
+            if pos != ValuePosition::None {
+                let vfs = shrink_to_fit(&row.value, fs, x1 - x0);
+                text(img, &row.value, x1, cy, white(vfs).anchor(Anchor::Right));
+            }
+            return;
+        }
+        let gh = if self.cfg.graphic == StatGraphic::Histogram || pos == ValuePosition::OnTop { tall } else { bar };
+        let gy = cy - gh / 2;
+        let gap = 4;
+        match pos {
+            ValuePosition::None => self.draw_viz(img, row, (x0, gy, x1 - x0, gh)),
+            ValuePosition::Before | ValuePosition::Behind => {
+                let vfs = shrink_to_fit(&row.value, fs, (x1 - x0) * 2 / 5);
+                let vw = text_width(&row.value, vfs, regular());
+                if pos == ValuePosition::Behind {
+                    text(img, &row.value, x1, cy, white(vfs).anchor(Anchor::Right));
+                    self.draw_viz(img, row, (x0, gy, x1 - vw - gap - x0, gh));
+                } else {
+                    text(img, &row.value, x0, cy, white(vfs));
+                    self.draw_viz(img, row, (x0 + vw + gap, gy, x1 - x0 - vw - gap, gh));
+                }
+            }
+            ValuePosition::OnTop => {
+                self.draw_viz(img, row, (x0, gy, x1 - x0, gh));
+                // digits are about 0.7 × the font size tall; keep them inside the graphic
+                let vfs = shrink_to_fit(&row.value, fs.min((gh - 2) as f32 / 0.7), x1 - x0 - 4);
+                text_inverted(img, &row.value, (x0 + x1) / 2, cy, white(vfs).anchor(Anchor::Center));
             }
         }
     }
@@ -373,43 +424,38 @@ impl Screen for StatsScreen {
         let slots = if pages > 1 { per_page } else { rows.len() } as i32;
         let rh = h / slots;
         let accent = self.cfg.accent;
+        let gap = self.cfg.label_gap.min(40) as i32;
+        // landscape label column: as wide as the widest label of all pages, so rows line up
+        let label_fs = (rh as f32 * 0.62).clamp(8.0, 24.0);
+        let label_col = rows.iter().map(|r| text_width(r.item.short(), label_fs, bold())).max().unwrap_or(0);
 
         for (i, row) in visible.iter().enumerate() {
             let y0 = i as i32 * rh;
             if narrow {
-                // label and value on one line, bar/graph underneath
+                // label on top; graphic and value on the line underneath
                 let fs = (rh as f32 * 0.45).clamp(8.0, 13.0);
                 let ty = y0 + (rh as f32 * 0.32) as i32;
                 text(&mut img, row.item.short(), 1, ty, Style::new(fs, bold(), accent));
-                let vfs = shrink_to_fit(&row.value, fs * 0.95, w - 4 - text_width(row.item.short(), fs, bold()));
-                text(
-                    &mut img,
-                    &row.value,
-                    w - 1,
-                    ty,
-                    Style::new(vfs, regular(), [230, 230, 230]).anchor(Anchor::Right),
-                );
-                let vy = y0 + (rh as f32 * 0.62) as i32;
-                self.draw_viz(&mut img, row, (1, vy, w - 2, (y0 + rh - 2 - vy).max(2)));
+                if !self.has_viz(row) {
+                    // no graphic: the value goes on the label's line
+                    let x0 = 1 + text_width(row.item.short(), fs, bold()) + gap;
+                    self.draw_body(&mut img, row, (x0, w - 1), ty, (0, 0), fs * 0.95);
+                    continue;
+                }
+                let value_below = self.cfg.value_position != ValuePosition::None;
+                let vy = y0 + (rh as f32 * if value_below { 0.52 } else { 0.62 }) as i32;
+                let gh = (y0 + rh - 2 - vy).max(2);
+                let vfs = (fs * 0.95).min(gh as f32 / 0.7);
+                // keep the last row clear of the page dots in the bottom-right corner
+                let x1 = if pages > 1 && i as i32 == slots - 1 { w - 2 - pages as i32 * 4 } else { w - 1 };
+                self.draw_body(&mut img, row, (1, x1), vy + gh / 2, (gh, gh), vfs);
             } else {
-                let fs = (rh as f32 * 0.62).clamp(8.0, 24.0);
+                let fs = label_fs;
                 let cy = y0 + rh / 2;
-                let label_w = text_width("VRAM", fs, bold()) + 4;
                 text(&mut img, row.item.short(), 2, cy, Style::new(fs, bold(), accent));
-                let has_viz = row.multi.is_some() || (row.frac.is_some() && self.cfg.style != StatStyle::Text);
-                let max_value_w = if has_viz { w * 2 / 5 } else { w - label_w - 6 };
-                let vfs = shrink_to_fit(&row.value, fs * 0.85, max_value_w);
-                let vw = text_width(&row.value, vfs, regular());
-                text(
-                    &mut img,
-                    &row.value,
-                    w - 2,
-                    cy,
-                    Style::new(vfs, regular(), [230, 230, 230]).anchor(Anchor::Right),
-                );
-                let bh = (rh - 8).clamp(4, if self.cfg.style == StatStyle::Graphs { rh - 4 } else { 12 });
-                let x0 = label_w + 2;
-                self.draw_viz(&mut img, row, (x0, cy - bh / 2, w - 2 - vw - 5 - x0, bh));
+                let tall = (rh - 4).max(4);
+                let bar = (rh - 8).clamp(4, 12);
+                self.draw_body(&mut img, row, (2 + label_col + gap, w - 2), cy, (tall, bar), fs * 0.85);
             }
         }
         if pages > 1 {
@@ -542,8 +588,22 @@ mod tests {
     use crate::device::{canvas_size, orient, HEIGHT, WIDTH};
     use crate::render::{frame_to_rgb, ClockScreen};
 
-    /// Renders every value in every style and orientation. Set PREVIEW_DIR to also
-    /// save the pictures as PNG files.
+    /// Renders every value with every graphic, value position and orientation. Set
+    /// PREVIEW_DIR to also save the pictures as PNG files.
+    #[test]
+    fn old_style_setting_is_converted() {
+        use crate::config::Config;
+        let c: Config = serde_json::from_str(r#"{"stats": {"style": "graphs"}}"#).unwrap();
+        let mut stats = c.stats;
+        stats.migrate();
+        assert_eq!(stats.graphic, StatGraphic::Histogram);
+        assert!(!stats.outline);
+        let mut text: StatsConfig = serde_json::from_str(r#"{"style": "text"}"#).unwrap();
+        text.migrate();
+        assert_eq!((text.graphic, text.value_position), (StatGraphic::None, ValuePosition::Behind));
+        assert!(serde_json::to_string(&text).unwrap().find("\"style\"").is_none());
+    }
+
     #[test]
     fn render_all_layouts() {
         let dir = std::env::var_os("PREVIEW_DIR").map(PathBuf::from);
@@ -552,18 +612,25 @@ mod tests {
         for rotation in [0u16, 90] {
             let size = canvas_size(rotation);
             for (name, cfg) in [("default", few.clone()), ("all", all.clone())] {
-                for style in StatStyle::ALL {
-                    let mut s = StatsScreen::new(StatsConfig { style, ..cfg.clone() }, size);
-                    let mut frame = Vec::new();
-                    for _ in 0..3 {
-                        frame = s.render().0;
-                    }
-                    assert_eq!(frame.len(), size.0 * size.1);
-                    assert_eq!(orient(&frame, rotation).len(), WIDTH * HEIGHT);
-                    if let Some(d) = &dir {
-                        let _ = std::fs::create_dir_all(d);
-                        let file = d.join(format!("stats-{name}-{style:?}-{rotation}.png"));
-                        frame_to_rgb(&frame, size).save(file).unwrap();
+                for graphic in StatGraphic::ALL {
+                    for value_position in ValuePosition::ALL {
+                        for outline in [true, false] {
+                            let cfg = StatsConfig { graphic, value_position, outline, ..cfg.clone() };
+                            let mut s = StatsScreen::new(cfg, size);
+                            let mut frame = Vec::new();
+                            for _ in 0..3 {
+                                frame = s.render().0;
+                            }
+                            assert_eq!(frame.len(), size.0 * size.1);
+                            assert_eq!(orient(&frame, rotation).len(), WIDTH * HEIGHT);
+                            if let Some(d) = &dir {
+                                let _ = std::fs::create_dir_all(d);
+                                let o = if outline { "outline" } else { "plain" };
+                                let file =
+                                    d.join(format!("stats-{name}-{graphic:?}-{value_position:?}-{o}-{rotation}.png"));
+                                frame_to_rgb(&frame, size).save(file).unwrap();
+                            }
+                        }
                     }
                 }
             }
@@ -571,6 +638,52 @@ mod tests {
             if let Some(d) = &dir {
                 frame_to_rgb(&clock, size).save(d.join(format!("clock-{rotation}.png"))).unwrap();
             }
+        }
+    }
+
+    /// Makes the README pictures docs/screens-landscape.png and docs/screens-portrait.png
+    /// from live values: `README_DIR=docs cargo test --release readme_pictures -- --ignored`.
+    /// Takes about 40 s, to fill the histograms.
+    #[test]
+    #[ignore]
+    fn readme_pictures() {
+        use image::{imageops, Rgb, RgbImage};
+        let dir = PathBuf::from(std::env::var_os("README_DIR").expect("set README_DIR"));
+        let mut screens: Vec<(u16, StatsScreen)> = Vec::new();
+        for rotation in [0u16, 90] {
+            let size = canvas_size(rotation);
+            let all = StatsConfig { items: StatItem::ALL.to_vec(), page_seconds: 100_000, ..Default::default() };
+            let middle = if rotation == 0 {
+                StatsConfig { graphic: StatGraphic::Histogram, outline: false, ..all }
+            } else {
+                all
+            };
+            screens.push((rotation, StatsScreen::new(StatsConfig::default(), size)));
+            screens.push((rotation, StatsScreen::new(middle, size)));
+        }
+        let mut frames = vec![Vec::new(); screens.len()];
+        for i in 0..HISTORY {
+            // the last sample over a full second, like the app (rates such as NET)
+            std::thread::sleep(Duration::from_millis(if i + 1 == HISTORY { 1000 } else { 250 }));
+            for (f, (_, s)) in frames.iter_mut().zip(screens.iter_mut()) {
+                *f = s.render().0;
+            }
+        }
+        let (scale, gap) = (3u32, 12u32);
+        for (rotation, name) in [(0u16, "landscape"), (90, "portrait")] {
+            let size = canvas_size(rotation);
+            let clock = ClockScreen::new(None, size).render().0;
+            let mut panels: Vec<&Frame565> =
+                screens.iter().zip(&frames).filter(|((r, _), _)| *r == rotation).map(|(_, f)| f).collect();
+            panels.push(&clock);
+            let (w, h) = (size.0 as u32 * scale, size.1 as u32 * scale);
+            let n = panels.len() as u32;
+            let mut sheet = RgbImage::from_pixel(n * (w + gap) + gap, h + 2 * gap, Rgb([32, 34, 40]));
+            for (i, f) in panels.into_iter().enumerate() {
+                let big = imageops::resize(&frame_to_rgb(f, size), w, h, imageops::FilterType::Nearest);
+                imageops::replace(&mut sheet, &big, (gap + i as u32 * (w + gap)) as i64, gap as i64);
+            }
+            sheet.save(dir.join(format!("screens-{name}.png"))).unwrap();
         }
     }
 }

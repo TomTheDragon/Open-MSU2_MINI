@@ -1,12 +1,13 @@
 //! Control window. Uses wxWidgets, i.e. the platform's own controls and theme:
 //! GTK on Linux, Win32 (incl. dark mode) on Windows, Cocoa on macOS.
 
-use crate::config::{self, fps_class, fps_label, Config, Mode, FPS_CHOICES};
+use crate::config::{self, fps_class, fps_label, Config, Mode, TrayIcon, FPS_CHOICES};
 use crate::controller;
 use crate::flash;
+use crate::gui_tray::{self, Action, Tray};
 use crate::scale::Scaling;
 use anyhow::Result;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -55,6 +56,11 @@ fn build(cfg: Config, resume_background: bool) {
     let handle = Rc::new(RefCell::new(controller::spawn(cfg.clone(), true, |_| {})));
 
     let frame = Frame::builder().with_title("Open MSU2_MINI").build();
+    if let Some(icon) =
+        BitmapBundle::from_svg_text(gui_tray::ICON_SVG, Size::new(64, 64)).and_then(|b| b.get_bitmap(Size::new(64, 64)))
+    {
+        frame.set_icon(&icon);
+    }
     let panel = Panel::builder(&frame).build();
     let root = BoxSizer::builder(Orientation::Vertical).build();
     let pad = 8;
@@ -72,7 +78,7 @@ fn build(cfg: Config, resume_background: bool) {
     // -- modes ----------------------------------------------------------------------
     let mode_box = StaticBoxSizerBuilder::new_with_label(Orientation::Vertical, &panel, "Show on the screen").build();
     let mode_parent = mode_box.get_static_box().unwrap();
-    let mode_grid = GridSizer::builder(3, 2).with_vgap(4).with_hgap(16).build();
+    let mode_grid = GridSizer::builder(4, 2).with_vgap(4).with_hgap(16).build();
     let mut radios = Vec::new();
     for (i, m) in Mode::ALL.iter().enumerate() {
         let mut b = RadioButton::builder(&mode_parent).with_label(m.label());
@@ -266,6 +272,58 @@ fn build(cfg: Config, resume_background: bool) {
     grid.add(&image_name, 0, cv, 0);
     grid.add(&image_btn, 0, cv, 0);
 
+    let video_name = StaticText::builder(&op).with_label(&file_name(&cfg.video)).build();
+    let video_btn = Button::builder(&op).with_label("Choose...").build();
+    video_btn.set_tooltip(
+        "MP4/MOV with H.264 works directly; other formats\n\
+         (WebM, MKV, AVI, HEVC, ...) need ffmpeg installed.",
+    );
+    {
+        let (h, f, name, radios2) = (handle.clone(), frame, video_name, radios.clone());
+        video_btn.on_click(move |_| {
+            if let Some(p) = pick_video(&f) {
+                name.set_label(&file_name(&Some(p.clone())));
+                h.borrow().update(|c| {
+                    c.video = Some(p);
+                    c.mode = Mode::Video;
+                });
+                for (m, rb) in &radios2 {
+                    rb.set_value(*m == Mode::Video);
+                }
+            }
+        });
+    }
+    grid.add(&label("Video:"), 0, cv, 0);
+    grid.add(&video_name, 0, cv, 0);
+    grid.add(&video_btn, 0, cv, 0);
+
+    let video_sound = CheckBox::builder(&op).with_label("Sound").build();
+    video_sound.set_value(cfg.video_sound);
+    video_sound.set_tooltip("Play the video's sound on the computer's default sound output.");
+    {
+        let (h, cb) = (handle.clone(), video_sound);
+        video_sound.on_toggled(move |_| {
+            let on = cb.get_value();
+            h.borrow().update(|c| c.video_sound = on);
+        });
+    }
+    let video_loop = CheckBox::builder(&op).with_label("Loop").build();
+    video_loop.set_value(cfg.video_loop);
+    video_loop.set_tooltip("Start the video again at the end.\nOff: it plays once and its last picture stays.");
+    {
+        let (h, cb) = (handle.clone(), video_loop);
+        video_loop.on_toggled(move |_| {
+            let on = cb.get_value();
+            h.borrow().update(|c| c.video_loop = on);
+        });
+    }
+    let video_opts = BoxSizer::builder(Orientation::Horizontal).build();
+    video_opts.add(&video_sound, 0, cv, 0);
+    video_opts.add(&video_loop, 0, cv | SizerFlag::Left, 16);
+    grid.add(&label("Video playback:"), 0, cv, 0);
+    grid.add_sizer(&video_opts, 0, cv, 0);
+    grid.add(&label(""), 0, cv, 0);
+
     let bg_name = StaticText::builder(&op).with_label(&file_name(&cfg.clock_background)).build();
     let bg_btns = BoxSizer::builder(Orientation::Horizontal).build();
     let bg_btn = Button::builder(&op).with_label("Choose...").build();
@@ -290,6 +348,31 @@ fn build(cfg: Config, resume_background: bool) {
     grid.add(&label("Clock background:"), 0, cv, 0);
     grid.add(&bg_name, 0, cv, 0);
     grid.add_sizer(&bg_btns, 0, cv, 0);
+
+    // window: taskbar / notification area, start minimized
+    let tray_choice =
+        Choice::builder(&op).with_choices(TrayIcon::ALL.iter().map(|t| t.name().to_string()).collect()).build();
+    tray_choice.set_selection(TrayIcon::ALL.iter().position(|t| *t == cfg.tray_icon).unwrap_or(0) as u32);
+    tray_choice.set_tooltip(
+        "Notification area: the window leaves the taskbar when minimized;\n\
+         click the icon or use its menu to bring it back.",
+    );
+    let start_min = CheckBox::builder(&op).with_label("Start minimized").build();
+    start_min.set_value(cfg.start_minimized);
+    start_min.set_tooltip(
+        "Open the window minimized. With the icon in the notification area only,\n\
+         the window stays hidden until you click the icon.",
+    );
+    {
+        let (h, cb) = (handle.clone(), start_min);
+        start_min.on_toggled(move |_| {
+            let on = cb.get_value();
+            h.borrow().update(|c| c.start_minimized = on);
+        });
+    }
+    grid.add(&label("Window icon in:"), 0, cv, 0);
+    grid.add(&tray_choice, 0, cv, 0);
+    grid.add(&start_min, 0, cv, 0);
 
     opt_box.add_sizer(&grid, 0, SizerFlag::Expand | SizerFlag::All, 6);
     root.add_sizer(&opt_box, 0, SizerFlag::Expand | SizerFlag::Left | SizerFlag::Right | SizerFlag::Top, pad);
@@ -378,6 +461,51 @@ fn build(cfg: Config, resume_background: bool) {
     outer.add(&panel, 1, SizerFlag::Expand, 0);
     frame.set_sizer_and_fit(outer, true);
 
+    // -- notification area icon -------------------------------------------------------
+    let quit = Rc::new(Cell::new(false));
+    let on_tray = {
+        let (h, f, quit) = (handle.clone(), frame, quit.clone());
+        move |a: Action| match a {
+            Action::ToggleWindow => {
+                if f.is_shown() && !f.is_iconized() {
+                    if h.borrow().cfg.lock().unwrap().tray_icon == TrayIcon::Tray {
+                        f.hide();
+                    } else {
+                        f.iconize(true);
+                    }
+                } else {
+                    f.show(true);
+                    f.iconize(false);
+                    f.raise();
+                }
+            }
+            Action::Mode(m) => h.borrow().update(|c| c.mode = m),
+            // closed from the timer: the tray icon must not be removed inside its own event
+            Action::Quit => quit.set(true),
+        }
+    };
+    let tray: Rc<RefCell<Option<Tray>>> = Rc::new(RefCell::new(None));
+    if cfg.tray_icon.in_tray() {
+        *tray.borrow_mut() = Some(Tray::new(cfg.mode, on_tray.clone()));
+    }
+    {
+        let (h, tray, f) = (handle.clone(), tray.clone(), frame);
+        tray_choice.on_selection_changed(move |e| {
+            let Some(i) = e.get_selection() else { return };
+            let t = TrayIcon::ALL[i as usize];
+            h.borrow().update(|c| c.tray_icon = t);
+            let mut tr = tray.borrow_mut();
+            if t.in_tray() && tr.is_none() {
+                *tr = Some(Tray::new(h.borrow().cfg.lock().unwrap().mode, on_tray.clone()));
+            } else if !t.in_tray() {
+                if let Some(old) = tr.take() {
+                    old.remove();
+                }
+                f.show(true);
+            }
+        });
+    }
+
     // -- periodic UI refresh (status, button-driven mode changes, flash progress) -------
     let timer = Rc::new(Timer::new(&frame));
     {
@@ -385,14 +513,27 @@ fn build(cfg: Config, resume_background: bool) {
         let buttons = [album_btn, anim_btn];
         let last_text = RefCell::new(String::new());
         let last_mode = RefCell::new(cfg.mode);
+        let (tray, quit) = (tray.clone(), quit.clone());
         timer.on_tick(move |_| {
+            if quit.get() {
+                f.close(true);
+                return;
+            }
+            // notification area only: a minimized window leaves the taskbar
+            let tray_only = h.borrow().cfg.lock().unwrap().tray_icon == TrayIcon::Tray;
+            if tray_only && tray.borrow().is_some() && f.is_shown() && f.is_iconized() {
+                f.hide();
+            }
             let s = h.borrow().status.lock().unwrap().clone();
             if *last_text.borrow() != s.text {
                 status.set_label(&s.text);
                 *last_text.borrow_mut() = s.text.clone();
                 f.layout();
             }
-            let r = if s.connected && s.fps > 0.0 && matches!(s.mode, Mode::Mirror | Mode::Animation | Mode::Image) {
+            let r = if s.connected
+                && s.fps > 0.0
+                && matches!(s.mode, Mode::Mirror | Mode::Animation | Mode::Image | Mode::Video)
+            {
                 format!("{:.0} fps · {:.0} KB/s", s.fps, s.kbps)
             } else {
                 String::new()
@@ -406,6 +547,9 @@ fn build(cfg: Config, resume_background: bool) {
                 *last_mode.borrow_mut() = mode;
                 for (m, rb) in &radios {
                     rb.set_value(*m == mode);
+                }
+                if let Some(t) = tray.borrow().as_ref() {
+                    t.set_mode(mode);
                 }
             }
             let mut fs = st.lock().unwrap();
@@ -433,9 +577,12 @@ fn build(cfg: Config, resume_background: bool) {
     timer.start(250, false);
 
     {
-        let (h, t) = (handle.clone(), timer.clone());
+        let (h, t, tray) = (handle.clone(), timer.clone(), tray.clone());
         frame.on_close(move |e| {
             t.stop();
+            if let Some(tr) = tray.borrow_mut().take() {
+                tr.remove();
+            }
             h.borrow_mut().stop();
             if resume_background {
                 restart_background();
@@ -444,16 +591,32 @@ fn build(cfg: Config, resume_background: bool) {
         });
     }
 
-    frame.show(true);
     frame.centre();
+    if !cfg.start_minimized {
+        frame.show(true);
+    } else if !(cfg.tray_icon == TrayIcon::Tray && tray.borrow().is_some()) {
+        frame.show(true);
+        frame.iconize(true);
+    }
+    // (notification area only + start minimized: stay hidden until the icon is clicked)
     // keep the timer alive for the lifetime of the window
     std::mem::forget(timer);
 }
 
 fn pick_file(parent: &Frame, title: &str) -> Option<PathBuf> {
+    pick(parent, title, IMAGE_WILDCARD)
+}
+
+fn pick_video(parent: &Frame) -> Option<PathBuf> {
+    let pattern: Vec<String> = crate::video::EXTENSIONS.iter().map(|e| format!("*.{e}")).collect();
+    let pattern = pattern.join(";");
+    pick(parent, "Choose a video", &format!("Videos ({pattern})|{pattern}|All files|*"))
+}
+
+fn pick(parent: &Frame, title: &str, wildcard: &str) -> Option<PathBuf> {
     let d = FileDialog::builder(parent)
         .with_message(title)
-        .with_wildcard(IMAGE_WILDCARD)
+        .with_wildcard(wildcard)
         .with_style(FileDialogStyle::Open | FileDialogStyle::FileMustExist)
         .build();
     if d.show_modal() == ID_OK {

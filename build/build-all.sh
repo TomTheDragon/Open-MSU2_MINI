@@ -2,7 +2,8 @@
 # Build the Linux and Windows executables into dist/ (needs Docker).
 set -e
 cd "$(dirname "$0")/.."
-docker image inspect open-msu2-build >/dev/null 2>&1 || docker build -t open-msu2-build build/
+# always (re)build the image: cached and quick when build/Dockerfile is unchanged
+docker build -q -t open-msu2-build build/
 build/cargo-docker.sh build --release
 build/build-windows.sh
 rm -rf dist && mkdir -p dist

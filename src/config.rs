@@ -11,18 +11,21 @@ pub enum Mode {
     Stats,
     Clock,
     Image,
+    Video,
     Album,
     Animation,
 }
 
 impl Mode {
-    pub const ALL: [Mode; 6] = [Mode::Mirror, Mode::Stats, Mode::Clock, Mode::Image, Mode::Album, Mode::Animation];
+    pub const ALL: [Mode; 7] =
+        [Mode::Mirror, Mode::Stats, Mode::Clock, Mode::Image, Mode::Video, Mode::Album, Mode::Animation];
     pub fn label(self) -> &'static str {
         match self {
             Mode::Mirror => "Screen mirror",
             Mode::Stats => "System monitor",
             Mode::Clock => "Clock",
             Mode::Image => "Image / GIF",
+            Mode::Video => "Video",
             Mode::Album => "Album (stored on device)",
             Mode::Animation => "Animation (stored on device)",
         }
@@ -47,9 +50,19 @@ pub struct Config {
     pub monitor: usize,
     pub max_fps: f32,
     pub image: Option<PathBuf>,
+    /// Video for the video mode
+    pub video: Option<PathBuf>,
+    /// Play the video's sound
+    pub video_sound: bool,
+    /// Start the video again at the end (otherwise its last picture stays)
+    pub video_loop: bool,
     pub clock_background: Option<PathBuf>,
     pub port: Option<String>,
     pub stats: StatsConfig,
+    /// Icon of the control window: taskbar, notification area or both
+    pub tray_icon: TrayIcon,
+    /// Open the control window minimized (or only in the notification area)
+    pub start_minimized: bool,
 }
 
 impl Default for Config {
@@ -65,9 +78,14 @@ impl Default for Config {
             monitor: 0,
             max_fps: 60.0,
             image: None,
+            video: None,
+            video_sound: false,
+            video_loop: true,
             clock_background: None,
             port: None,
             stats: StatsConfig::default(),
+            tray_icon: TrayIcon::Taskbar,
+            start_minimized: false,
         }
     }
 }
@@ -223,25 +241,58 @@ impl StatItem {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// Old setting (before graphic and value position were separate); read once and converted
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StatStyle {
-    /// Bar showing the current value
-    #[default]
     Bars,
-    /// Line graph of the last minutes
     Graphs,
-    /// Numbers only
     Text,
 }
 
-impl StatStyle {
-    pub const ALL: [StatStyle; 3] = [StatStyle::Bars, StatStyle::Graphs, StatStyle::Text];
+/// Graphic next to each value
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum StatGraphic {
+    None,
+    /// Bar showing the current value
+    #[default]
+    Bars,
+    /// Column graph of the last minutes
+    Histogram,
+}
+
+impl StatGraphic {
+    pub const ALL: [StatGraphic; 3] = [StatGraphic::None, StatGraphic::Bars, StatGraphic::Histogram];
     pub fn name(self) -> &'static str {
         match self {
-            StatStyle::Bars => "Bars",
-            StatStyle::Graphs => "History graphs",
-            StatStyle::Text => "Numbers only",
+            StatGraphic::None => "None",
+            StatGraphic::Bars => "Bars",
+            StatGraphic::Histogram => "Histogram (history)",
+        }
+    }
+}
+
+/// Where the value (e.g. "45%") goes relative to the graphic
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ValuePosition {
+    None,
+    Before,
+    #[default]
+    Behind,
+    OnTop,
+}
+
+impl ValuePosition {
+    pub const ALL: [ValuePosition; 4] =
+        [ValuePosition::None, ValuePosition::Before, ValuePosition::Behind, ValuePosition::OnTop];
+    pub fn name(self) -> &'static str {
+        match self {
+            ValuePosition::None => "None",
+            ValuePosition::Before => "Before the graphic",
+            ValuePosition::Behind => "Behind the graphic",
+            ValuePosition::OnTop => "On top of the graphic",
         }
     }
 }
@@ -251,7 +302,15 @@ impl StatStyle {
 pub struct StatsConfig {
     /// Shown items, in this order
     pub items: Vec<StatItem>,
-    pub style: StatStyle,
+    pub graphic: StatGraphic,
+    pub value_position: ValuePosition,
+    /// Grey frame around bars and histograms
+    pub outline: bool,
+    /// Space in pixels between the labels (CPU, RAM, ...) and what follows them
+    pub label_gap: u32,
+    /// Old setting; converted by `migrate`
+    #[serde(skip_serializing)]
+    pub style: Option<StatStyle>,
     /// Rows per page; 0 = as many as fit
     pub rows: u32,
     /// Seconds per page when there are more items than rows
@@ -260,7 +319,7 @@ pub struct StatsConfig {
     pub interval_ms: u32,
     /// Colour of the labels
     pub accent: [u8; 3],
-    /// Colour bars green / yellow / red by value (otherwise the label colour)
+    /// Colour bars and histograms green / yellow / red by value (otherwise the label colour)
     pub load_colors: bool,
     /// Show the temperature next to CPU and GPU usage
     pub temp_with_usage: bool,
@@ -271,7 +330,11 @@ impl Default for StatsConfig {
     fn default() -> Self {
         StatsConfig {
             items: vec![StatItem::Cpu, StatItem::Gpu, StatItem::Ram, StatItem::Net],
-            style: StatStyle::Bars,
+            graphic: StatGraphic::Bars,
+            value_position: ValuePosition::Behind,
+            outline: true,
+            label_gap: 6,
+            style: None,
             rows: 0,
             page_seconds: 5,
             interval_ms: 1000,
@@ -280,6 +343,52 @@ impl Default for StatsConfig {
             temp_with_usage: true,
             fahrenheit: false,
         }
+    }
+}
+
+impl StatsConfig {
+    /// Convert the old combined `style` setting.
+    pub(crate) fn migrate(&mut self) {
+        match self.style.take() {
+            Some(StatStyle::Bars) => self.graphic = StatGraphic::Bars,
+            Some(StatStyle::Graphs) => {
+                self.graphic = StatGraphic::Histogram;
+                self.outline = false;
+            }
+            Some(StatStyle::Text) => {
+                self.graphic = StatGraphic::None;
+                self.value_position = ValuePosition::Behind;
+            }
+            None => {}
+        }
+    }
+}
+
+// -- window --------------------------------------------------------------------------
+
+/// Where the control window shows its icon
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TrayIcon {
+    /// Taskbar only (normal window)
+    #[default]
+    Taskbar,
+    /// Notification area only; the minimized window disappears from the taskbar
+    Tray,
+    Both,
+}
+
+impl TrayIcon {
+    pub const ALL: [TrayIcon; 3] = [TrayIcon::Taskbar, TrayIcon::Tray, TrayIcon::Both];
+    pub fn name(self) -> &'static str {
+        match self {
+            TrayIcon::Taskbar => "Taskbar",
+            TrayIcon::Tray => "Notification area",
+            TrayIcon::Both => "Taskbar and notification area",
+        }
+    }
+    pub fn in_tray(self) -> bool {
+        self != TrayIcon::Taskbar
     }
 }
 
@@ -301,6 +410,7 @@ impl Config {
         }
         c.rotation = normalize_rotation(c.rotation);
         c.max_fps = c.max_fps.clamp(0.1, 1000.0);
+        c.stats.migrate();
         c
     }
 
