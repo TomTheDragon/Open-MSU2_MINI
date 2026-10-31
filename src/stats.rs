@@ -46,6 +46,11 @@ pub struct StatsScreen {
     gpus: Option<GpuList>,
     amd_gpu: Option<PathBuf>,
     nvidia: bool,
+    /// Windows: CPU load from the kernel (sysinfo's performance counters can be missing)
+    #[cfg(windows)]
+    win_cpu: wincpu::WinCpu,
+    /// Last search for temperature sensors (Windows: slow, and usually finds none)
+    comps_searched: Option<Instant>,
     last: Instant,
     started: Instant,
     history: HashMap<StatItem, VecDeque<f32>>,
@@ -73,6 +78,9 @@ impl StatsScreen {
             gpus,
             amd_gpu,
             nvidia,
+            #[cfg(windows)]
+            win_cpu: wincpu::WinCpu::new(),
+            comps_searched: None,
             last: Instant::now(),
             started: Instant::now(),
             history: HashMap::new(),
@@ -90,6 +98,24 @@ impl StatsScreen {
             }
         }
         None
+    }
+
+    /// Total CPU load in percent
+    fn cpu_usage(&self) -> f32 {
+        #[cfg(windows)]
+        if let Some(u) = self.win_cpu.total {
+            return u;
+        }
+        self.sys.global_cpu_usage()
+    }
+
+    /// Load of each CPU core in percent
+    fn core_usage(&self) -> Vec<f32> {
+        #[cfg(windows)]
+        if !self.win_cpu.cores.is_empty() {
+            return self.win_cpu.cores.clone();
+        }
+        self.sys.cpus().iter().map(|c| c.usage()).collect()
     }
 
     fn cpu_temp(&self) -> Option<f32> {
@@ -140,8 +166,18 @@ impl StatsScreen {
             self.sys.refresh_memory();
         }
         if items.iter().any(|i| matches!(i, StatItem::Cpu | StatItem::CpuTemp | StatItem::Gpu | StatItem::GpuTemp)) {
-            self.comps.refresh(false);
+            // with no sensors found, sysinfo searches again on every refresh (on Windows a
+            // WMI query that needs admin rights); do that at most once a minute
+            let search_due = self.comps_searched.is_none_or(|t| t.elapsed() >= Duration::from_secs(60));
+            if !self.comps.is_empty() || search_due {
+                if self.comps.is_empty() {
+                    self.comps_searched = Some(Instant::now());
+                }
+                self.comps.refresh(false);
+            }
         }
+        #[cfg(windows)]
+        self.win_cpu.refresh();
         if has(StatItem::Net) {
             self.nets.refresh(false);
         }
@@ -163,7 +199,7 @@ impl StatsScreen {
             let mut row = Row { item, value: "n/a".into(), frac: None, multi: None };
             match item {
                 StatItem::Cpu => {
-                    let u = self.sys.global_cpu_usage();
+                    let u = self.cpu_usage();
                     row.value = format!("{u:.0}%");
                     if let Some(t) = self.cpu_temp().filter(|_| with_temp) {
                         row.value += &format!(" {}", self.deg(t));
@@ -184,7 +220,7 @@ impl StatsScreen {
                     }
                 }
                 StatItem::CpuCores => {
-                    let v: Vec<f32> = self.sys.cpus().iter().map(|c| c.usage() / 100.0).collect();
+                    let v: Vec<f32> = self.core_usage().iter().map(|u| u / 100.0).collect();
                     let max = v.iter().cloned().fold(0.0, f32::max);
                     row.value = format!("{} ↑{:.0}%", v.len(), max * 100.0);
                     row.multi = Some(v);
@@ -509,6 +545,94 @@ fn main_disk(disks: &Disks) -> Option<&sysinfo::Disk> {
         .or_else(|| disks.iter().max_by_key(|d| d.total_space()))
 }
 
+/// CPU load on Windows from NtQuerySystemInformation, like Task Manager. sysinfo uses
+/// performance counters (PDH), which are missing or broken on some systems.
+#[cfg(windows)]
+mod wincpu {
+    /// SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION (times in 100 ns; kernel includes idle)
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct Times {
+        idle: i64,
+        kernel: i64,
+        user: i64,
+        dpc: i64,
+        interrupt: i64,
+        interrupt_count: u32,
+    }
+
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtQuerySystemInformation(class: u32, info: *mut core::ffi::c_void, len: u32, ret_len: *mut u32) -> i32;
+    }
+
+    const SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION: u32 = 8;
+
+    #[derive(Default)]
+    pub struct WinCpu {
+        prev: Vec<Times>,
+        /// Percent; None until two readings exist (or when the call fails)
+        pub total: Option<f32>,
+        pub cores: Vec<f32>,
+    }
+
+    impl WinCpu {
+        pub fn new() -> Self {
+            let mut c = WinCpu::default();
+            c.refresh();
+            c
+        }
+
+        pub fn refresh(&mut self) {
+            let mut now = vec![Times::default(); 256];
+            let size = std::mem::size_of::<Times>();
+            let mut ret = 0u32;
+            let status = unsafe {
+                NtQuerySystemInformation(
+                    SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION,
+                    now.as_mut_ptr().cast(),
+                    (now.len() * size) as u32,
+                    &mut ret,
+                )
+            };
+            if status < 0 {
+                self.total = None;
+                self.cores.clear();
+                return;
+            }
+            now.truncate(ret as usize / size);
+            if self.prev.len() == now.len() && !now.is_empty() {
+                let busy = |a: &Times, b: &Times| {
+                    let idle = a.idle - b.idle;
+                    let all = (a.kernel - b.kernel) + (a.user - b.user);
+                    (all - idle, all)
+                };
+                let (mut sum_busy, mut sum_all) = (0i64, 0i64);
+                self.cores = now
+                    .iter()
+                    .zip(&self.prev)
+                    .map(|(a, b)| {
+                        let (busy, all) = busy(a, b);
+                        sum_busy += busy;
+                        sum_all += all;
+                        percent(busy, all)
+                    })
+                    .collect();
+                self.total = Some(percent(sum_busy, sum_all));
+            }
+            self.prev = now;
+        }
+    }
+
+    fn percent(busy: i64, all: i64) -> f32 {
+        if all > 0 {
+            (busy as f32 / all as f32 * 100.0).clamp(0.0, 100.0)
+        } else {
+            0.0
+        }
+    }
+}
+
 /// AMD GPUs on Linux report load and VRAM in sysfs.
 fn amd_gpu_dir() -> Option<PathBuf> {
     let mut dirs: Vec<PathBuf> = std::fs::read_dir("/sys/class/drm")
@@ -579,6 +703,23 @@ fn battery() -> Option<(f32, bool)> {
     }
     #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
     None
+}
+
+/// `open-msu2-mini sysinfo`: every value, read three times, with the time each read takes.
+pub fn print_values() {
+    let cfg = StatsConfig { items: StatItem::ALL.to_vec(), ..Default::default() };
+    let t = Instant::now();
+    let mut s = StatsScreen::new(cfg, crate::device::canvas_size(0));
+    println!("start: {} ms", t.elapsed().as_millis());
+    for round in 1..=3 {
+        std::thread::sleep(Duration::from_secs(1));
+        let t = Instant::now();
+        let rows = s.collect();
+        println!("-- read {round}: {} ms", t.elapsed().as_millis());
+        for r in rows {
+            println!("{:<12} {}", format!("{:?}", r.item), r.value);
+        }
+    }
 }
 
 #[cfg(test)]

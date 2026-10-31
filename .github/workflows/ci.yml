@@ -50,6 +50,17 @@ jobs:
         with:
           name: ${{ matrix.asset }}
           path: ${{ matrix.asset }}
+      - name: Linux packages (deb, rpm, Arch)
+        if: runner.os == 'Linux'
+        run: build/package.sh ${{ matrix.asset }}
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux'
+        with:
+          name: linux-packages
+          path: |
+            dist/*.deb
+            dist/*.rpm
+            dist/*.pkg.tar.zst
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -63,4 +74,4 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
-          files: open-msu2-mini-*
+          files: open-msu2-mini*

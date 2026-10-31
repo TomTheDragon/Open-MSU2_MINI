@@ -138,11 +138,14 @@ enum Cmd {
     /// Store pictures permanently on the device
     Flash {
         what: FlashWhat,
-        /// Picture (album, clock-background) or GIF / folder of pictures (animation)
+        /// Picture (album, clock-background), or picture / GIF / folder of pictures (animation:
+        /// what the device shows by itself without a PC; a single picture stays still)
         source: PathBuf,
         #[arg(long, default_value = "crop")]
         fit: FitArg,
     },
+    /// Print what the system monitor reads on this computer (no device needed)
+    Sysinfo,
     /// Measure the frame rate with different kinds of content
     Bench {
         /// Seconds per test
@@ -347,6 +350,10 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
             println!("Done in {:.1} s.", t.elapsed().as_secs_f64());
+            Ok(())
+        }
+        Cmd::Sysinfo => {
+            stats::print_values();
             Ok(())
         }
         Cmd::Bench { seconds, mirror } => bench(cli.port.as_deref(), seconds, mirror),

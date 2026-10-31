@@ -12,10 +12,11 @@ It replaces the vendor's Windows-only demo tool and runs on **Linux, Windows and
   behind or on top of it, in any order, with pages when they don't fit on one screen.
 - **Clock** and **pictures / animated GIFs**.
 - **Videos**, optionally with sound (on the computer's speakers, in sync with the picture)
-  and in a loop. MP4/MOV with H.264 plays out of the box; other formats (WebM, MKV, AVI,
-  HEVC, ...) use [ffmpeg](https://ffmpeg.org) if it is installed.
-- **Writes to the device's flash**: the album picture, and the 36-frame animation it plays
-  while no PC is connected.
+  and in a loop. Decoded by [ffmpeg](https://ffmpeg.org): on Linux the system's package
+  (every format it knows); on Windows and macOS MP4/MOV with H.264 plays out of the box,
+  other formats (WebM, MKV, AVI, HEVC, ...) need ffmpeg installed.
+- **Writes to the device's flash**: what the device shows by itself while no PC is
+  connected (a picture, or a 36-frame animation from a GIF), and the album picture.
 - **Rotation by 0°, 90°, 180° or 270°.** At 90° and 270° the screen can stand upright; the
   system monitor and the clock then use portrait layouts.
 - The **button on the device** cycles through the modes.
@@ -42,9 +43,53 @@ Download the executable for your system from the
 
 | System | Notes |
 |---|---|
-| **Linux** x86_64 | Needs glibc 2.39+ (distributions from 2024 on), GTK 3, PipeWire, ALSA (libasound, for video sound) and libayatana-appindicator3 (for the tray icon). Your user must be in the `dialout` group: `sudo usermod -aG dialout $USER`, then log in again. `packaging/linux/install.sh` adds the program, an app-menu entry and optional autostart. |
-| **Windows** 10/11 | Just run the `.exe`; no driver needed. |
-| **macOS** | Allow "Screen Recording" for the app (or your terminal) to mirror the screen. |
+| **Linux** x86_64 | Packages for Ubuntu/Debian, Fedora/openSUSE and Arch, or a single executable; see [Linux](#linux) below. |
+| **Windows** 10/11 | Just run the `.exe`; no driver needed. Videos in formats other than MP4/H.264 need [ffmpeg](https://ffmpeg.org) (in PATH or next to the `.exe`). |
+| **macOS** | Allow "Screen Recording" for the app (or your terminal) to mirror the screen. Videos in formats other than MP4/H.264 need ffmpeg (`brew install ffmpeg`). |
+
+### Linux
+
+The Linux version uses the libraries of your distribution instead of bringing its own:
+GTK 3 (window), PipeWire (screen mirroring), ALSA (video sound, played through PipeWire or
+PulseAudio), Ayatana AppIndicator (tray icon), libSM, libudev, and **ffmpeg** for decoding
+videos and their sound. It needs glibc 2.39 or newer (distributions from 2024 on; Ubuntu
+22.04, Debian 12 and older are not supported).
+
+**Packages (recommended).** Download the package for your distribution from the
+[Releases](../../releases) page and install it; the package manager installs the libraries
+it needs. The packages also add an app-menu entry and a udev rule that gives the logged-in
+user access to the screen (no group membership or re-login needed; replug the screen once
+if it was connected during the installation).
+
+| Distribution | Package | Install |
+|---|---|---|
+| **Ubuntu** 24.04+, **Debian** 13+, Linux Mint 22+, Pop!_OS 24.04+ | `.deb` | `sudo apt install ./open-msu2-mini_*_amd64.deb` |
+| **Fedora** 41+ | `.rpm` | `sudo dnf install ./open-msu2-mini-*.x86_64.rpm ffmpeg-free` |
+| **openSUSE** Tumbleweed | `.rpm` (the same file) | `sudo zypper install --allow-unsigned-rpm ./open-msu2-mini-*.x86_64.rpm` |
+| **Arch**, Manjaro, EndeavourOS | `.pkg.tar.zst` | `sudo pacman -U open-msu2-mini-*.pkg.tar.zst && sudo pacman -S --needed ffmpeg` |
+
+**Single executable.** Alternatively download `open-msu2-mini-linux-x86_64` and install the
+libraries yourself (most are already there on a desktop system):
+
+| Distribution | Command |
+|---|---|
+| **Ubuntu** 24.04+, **Debian** 13+, Linux Mint 22+, Pop!_OS 24.04+ | `sudo apt install libgtk-3-0t64 libpipewire-0.3-0t64 libayatana-appindicator3-1 libasound2t64 libsm6 ffmpeg` |
+| **Fedora** 41+ | `sudo dnf install gtk3 pipewire-libs libayatana-appindicator-gtk3 alsa-lib libSM ffmpeg-free` |
+| **Arch**, Manjaro, EndeavourOS | `sudo pacman -S --needed gtk3 libpipewire libayatana-appindicator alsa-lib libsm ffmpeg` |
+| **openSUSE** Tumbleweed | `sudo zypper install libgtk-3-0 libpipewire-0_3-0 libayatana-appindicator3-1 libasound2 libSM6 ffmpeg` |
+
+Then `chmod +x open-msu2-mini-linux-x86_64` and run it, or install it for your user with
+`packaging/linux/install.sh [--udev] [--autostart]` from a copy of this repository: it
+copies the program to `~/.local/bin`, adds an app-menu entry and optionally autostart and
+the udev rule, and reports missing libraries. Without the udev rule, add yourself to the
+group that owns serial ports and log in again: `sudo usermod -aG dialout $USER` (Arch:
+`uucp` instead of `dialout`).
+
+**ffmpeg** is only needed for the video mode. Fedora's `ffmpeg-free` and openSUSE's
+`ffmpeg` play common videos (tested: H.264 with AAC, VP9 with Opus). For HEVC and other
+patented formats, install the full ffmpeg from [RPM Fusion](https://rpmfusion.org) (Fedora:
+`sudo dnf swap ffmpeg-free ffmpeg --allowerasing`) or
+[Packman](https://en.opensuse.org/Additional_package_repositories#Packman) (openSUSE).
 
 ## Usage
 
@@ -61,9 +106,10 @@ open-msu2-mini run mirror --fps 0.5     # slowest: one picture every two seconds
 open-msu2-mini run mirror --monitor 1   # Windows/macOS: mirror the second monitor
 open-msu2-mini run mirror --reselect    # Linux: choose the shared screen/window again
 open-msu2-mini show cat.gif             # show a picture or GIF
-open-msu2-mini flash album photo.jpg    # store the album picture on the device
-open-msu2-mini flash animation clip.gif # or a folder with A0.png ... A35.png
+open-msu2-mini flash animation clip.gif # shown without PC: a GIF, a picture, or a folder A0.png ... A35.png
+open-msu2-mini flash album photo.jpg    # album picture (shown in the album mode, while the program runs)
 open-msu2-mini test                     # test pattern
+open-msu2-mini sysinfo                  # print what the system monitor reads on this computer
 open-msu2-mini bench --mirror           # measure the frame rate
 open-msu2-mini --help
 ```
@@ -83,6 +129,10 @@ open-msu2-mini --help
   Customize…* in the window (or edit the `stats` section of the settings file).
 - **Rotation:** pictures stored on the device (album, offline animation) are turned when they are
   written, so write them again after switching between landscape and portrait.
+- **System monitor values:** `open-msu2-mini sysinfo` prints every value as this computer
+  reports it (no device needed); please include its output when reporting wrong values. On
+  Windows, temperatures are usually not available: Windows reports them only to programs
+  running as administrator, and many PCs not at all.
 - **Scaling:** the panel is 2:1. `crop` fills it and cuts off the edges, `fit` adds black
   bars, `stretch` distorts.
 - **Window icon:** under *Window icon in* choose the taskbar, the notification area or both.
@@ -128,9 +178,16 @@ lossless frames.
 You need Rust (1.95+), CMake and a C++ compiler. wxWidgets is downloaded and compiled
 automatically on the first build, which takes a few minutes.
 
-- **Linux:** additionally `clang`, and the development packages for GTK 3, PipeWire,
-  Ayatana AppIndicator, libudev, ALSA and OpenSSL (`apt install libclang-dev libgtk-3-dev
-  libpipewire-0.3-dev libayatana-appindicator3-dev libudev-dev libasound2-dev libssl-dev`).
+- **Linux:** additionally `clang`, Ninja and the development packages of the libraries
+  listed under [Install](#linux) (plus OpenSSL, used to download wxWidgets). Install
+  [Rust with rustup](https://rustup.rs) if your distribution's Rust is older than 1.95.
+
+  | Distribution | Build dependencies |
+  |---|---|
+  | Ubuntu 24.04+, Debian 13+ | `sudo apt install build-essential cmake ninja-build clang libclang-dev pkg-config libgtk-3-dev libpipewire-0.3-dev libayatana-appindicator3-dev libudev-dev libasound2-dev libssl-dev libxkbcommon-dev libgl1-mesa-dev libglu1-mesa-dev libsm-dev libxtst-dev libjpeg-dev libtiff-dev libexpat1-dev` |
+  | Fedora | `sudo dnf install gcc-c++ cmake ninja-build clang-devel pkgconf-pkg-config gtk3-devel pipewire-devel libayatana-appindicator-gtk3-devel systemd-devel alsa-lib-devel openssl-devel libxkbcommon-devel mesa-libGL-devel mesa-libGLU-devel libSM-devel libXtst-devel libjpeg-turbo-devel libtiff-devel expat-devel` |
+  | Arch | `sudo pacman -S --needed base-devel cmake ninja clang gtk3 libpipewire libayatana-appindicator alsa-lib openssl libxkbcommon mesa glu libsm libxtst` |
+  | openSUSE Tumbleweed | `sudo zypper install gcc-c++ cmake ninja clang-devel pkg-config gtk3-devel pipewire-devel libayatana-appindicator3-devel systemd-devel alsa-devel libopenssl-devel libxkbcommon-devel Mesa-libGL-devel glu-devel libSM-devel libXtst-devel libjpeg8-devel libtiff-devel libexpat-devel` |
 - **Windows:** Visual Studio Build Tools and Ninja; build from a "Developer PowerShell".
 - **macOS:** Xcode command line tools, plus `brew install cmake ninja`.
 
@@ -143,7 +200,8 @@ cargo build --release --no-default-features # without the window (no wxWidgets)
 Windows is cross-compiled with Zig):
 
 ```sh
-build/build-all.sh   # writes dist/open-msu2-mini-linux-x86_64 and dist/open-msu2-mini-windows-x86_64.exe
+build/build-all.sh   # dist/: Linux and Windows executables, .deb, .rpm and Arch package
+build/package.sh     # only the packages, from dist/open-msu2-mini-linux-x86_64 (nfpm, packaging/linux/nfpm.yaml)
 ```
 
 GitHub Actions (`.github/workflows/ci.yml`) builds Linux, Windows and macOS (Intel and
@@ -158,7 +216,7 @@ Apple Silicon) on every push. A `v*` tag publishes the executables as a release.
 | `src/capture/` | Screen capture (portal + PipeWire on Linux, xcap on Windows/macOS) |
 | `src/stats.rs` | System monitor |
 | `src/render.rs`, `src/scale.rs` | Clock, pictures, text; scaling to the panel or a portrait canvas |
-| `src/video.rs`, `src/audio.rs` | Video playback (OpenH264 or ffmpeg) and its sound (Symphonia, cpal) |
+| `src/video.rs`, `src/audio.rs` | Video playback and its sound: ffmpeg (Linux; Windows/macOS: OpenH264 and Symphonia, ffmpeg for other formats), output with cpal |
 | `src/gui.rs`, `src/gui_stats.rs` | Window and system monitor settings (wxWidgets) |
 | `src/main.rs` | Command line, benchmark |
 | `build/` | Docker build environment and scripts |

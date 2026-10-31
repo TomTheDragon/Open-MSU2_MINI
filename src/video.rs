@@ -1,8 +1,9 @@
 //! Video playback: plays a video file on the screen, optionally with sound and in a loop.
 //!
-//! MP4/MOV files with H.264 video (what phones and most websites produce) are decoded
-//! inside the program (OpenH264). Everything else is handed to ffmpeg, if it is installed
-//! (in PATH or next to this program).
+//! Linux: decoded by ffmpeg (the system's package, any format it knows).
+//! Windows / macOS: MP4/MOV files with H.264 video (what phones and most websites produce)
+//! are decoded inside the program (OpenH264); everything else is handed to ffmpeg, if it is
+//! installed (in PATH or next to this program).
 //!
 //! Every frame carries its time in the video; it is shown when the playback clock gets
 //! there, and skipped when the device falls behind. With sound, the sound card is the clock.
@@ -10,9 +11,9 @@
 use crate::audio::Sound;
 use crate::device::Frame565;
 use crate::render::{Screen, Size};
-use crate::scale::{Order, Scaler, Scaling};
-use anyhow::{anyhow, bail, Context, Result};
-use std::io::{BufReader, Read};
+use crate::scale::Scaling;
+use anyhow::{Context, Result};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
@@ -63,11 +64,18 @@ impl VideoScreen {
     pub fn new(path: &Path, fit: Scaling, size: Size, playback: Playback) -> Result<Self> {
         let (tx, rx) = sync_channel::<Msg>(4);
         let looping = playback.looping;
-        match Mp4Source::open(path) {
+        #[cfg(target_os = "linux")]
+        {
+            let ffmpeg =
+                find_ffmpeg().ok_or_else(|| anyhow::anyhow!("videos need ffmpeg; install the ffmpeg package"))?;
+            start_ffmpeg_decoder(ffmpeg, path, fit, size, looping, tx)?;
+        }
+        #[cfg(not(target_os = "linux"))]
+        match builtin::Mp4Source::open(path) {
             Ok(src) => {
                 std::thread::Builder::new()
                     .name("video".into())
-                    .spawn(move || builtin_loop(src, fit, size, looping, tx))
+                    .spawn(move || builtin::run(src, fit, size, looping, tx))
                     .context("cannot start the video thread")?;
             }
             Err(builtin_err) => {
@@ -77,12 +85,7 @@ impl VideoScreen {
                          or use an MP4 file with H.264 video",
                     ));
                 };
-                let path = path.to_owned();
-                let child = start_ffmpeg(&ffmpeg, &path, fit, size)?;
-                std::thread::Builder::new()
-                    .name("video".into())
-                    .spawn(move || ffmpeg_loop(child, &ffmpeg, &path, fit, size, looping, tx))
-                    .context("cannot start the video thread")?;
+                start_ffmpeg_decoder(ffmpeg, path, fit, size, looping, tx)?;
             }
         }
         Ok(VideoScreen {
@@ -187,133 +190,161 @@ impl Screen for VideoScreen {
     }
 }
 
-// -- built-in: MP4/MOV + H.264 -----------------------------------------------------------
+// -- built-in: MP4/MOV + H.264 (Windows / macOS) ------------------------------------------
 
-struct Mp4Source {
-    path: PathBuf,
-    track_id: u32,
-    samples: u32,
-    frame_time: Duration,
-    length_size: usize,
-    /// SPS and PPS NAL units, in Annex B form (start code + unit)
-    params: Vec<u8>,
-}
+#[cfg(not(target_os = "linux"))]
+mod builtin {
+    use super::{Msg, Size};
+    use crate::scale::{Order, Scaler, Scaling};
+    use anyhow::{anyhow, bail, Context, Result};
+    use std::io::BufReader;
+    use std::path::{Path, PathBuf};
+    use std::sync::mpsc::SyncSender;
+    use std::time::Duration;
 
-fn open_mp4(path: &Path) -> Result<mp4::Mp4Reader<BufReader<std::fs::File>>> {
-    let f = std::fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
-    let len = f.metadata()?.len();
-    mp4::Mp4Reader::read_header(BufReader::new(f), len).map_err(|e| anyhow!("not an MP4/MOV file ({e})"))
-}
-
-impl Mp4Source {
-    fn open(path: &Path) -> Result<Self> {
-        let reader = open_mp4(path)?;
-        let track = reader
-            .tracks()
-            .values()
-            .find(|t| matches!(t.media_type(), Ok(mp4::MediaType::H264)))
-            .ok_or_else(|| anyhow!("the video is not H.264"))?;
-        let avcc = &track.trak.mdia.minf.stbl.stsd.avc1.as_ref().ok_or_else(|| anyhow!("no H.264 settings"))?.avcc;
-        let mut params = Vec::new();
-        for unit in avcc.sequence_parameter_sets.iter().chain(&avcc.picture_parameter_sets) {
-            params.extend([0, 0, 0, 1]);
-            params.extend(&unit.bytes);
-        }
-        let fps = track.frame_rate();
-        let fps = if fps.is_finite() && fps > 1.0 { fps.min(120.0) } else { 30.0 };
-        Ok(Mp4Source {
-            path: path.to_owned(),
-            track_id: track.track_id(),
-            samples: track.sample_count(),
-            frame_time: Duration::from_secs_f64(1.0 / fps),
-            length_size: avcc.length_size_minus_one as usize + 1,
-            params,
-        })
+    pub(super) struct Mp4Source {
+        path: PathBuf,
+        track_id: u32,
+        samples: u32,
+        frame_time: Duration,
+        length_size: usize,
+        /// SPS and PPS NAL units, in Annex B form (start code + unit)
+        params: Vec<u8>,
     }
 
-    /// MP4 stores NAL units with a length prefix; OpenH264 wants start codes. The
-    /// parameter sets live in the file header and are repeated before every key frame.
-    fn to_annex_b(&self, sample: &[u8], out: &mut Vec<u8>) {
-        out.clear();
-        let mut rest = sample;
-        let mut params_sent = false;
-        while rest.len() > self.length_size {
-            let len = rest[..self.length_size].iter().fold(0usize, |a, b| (a << 8) | *b as usize);
-            rest = &rest[self.length_size..];
-            if len == 0 || len > rest.len() {
-                break;
+    fn open_mp4(path: &Path) -> Result<mp4::Mp4Reader<BufReader<std::fs::File>>> {
+        let f = std::fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+        let len = f.metadata()?.len();
+        mp4::Mp4Reader::read_header(BufReader::new(f), len).map_err(|e| anyhow!("not an MP4/MOV file ({e})"))
+    }
+
+    impl Mp4Source {
+        pub(super) fn open(path: &Path) -> Result<Self> {
+            let reader = open_mp4(path)?;
+            let track = reader
+                .tracks()
+                .values()
+                .find(|t| matches!(t.media_type(), Ok(mp4::MediaType::H264)))
+                .ok_or_else(|| anyhow!("the video is not H.264"))?;
+            let avcc = &track.trak.mdia.minf.stbl.stsd.avc1.as_ref().ok_or_else(|| anyhow!("no H.264 settings"))?.avcc;
+            let mut params = Vec::new();
+            for unit in avcc.sequence_parameter_sets.iter().chain(&avcc.picture_parameter_sets) {
+                params.extend([0, 0, 0, 1]);
+                params.extend(&unit.bytes);
             }
-            let unit = &rest[..len];
-            rest = &rest[len..];
-            // before the key frame's picture data (encoders often put an SEI unit first)
-            if !params_sent && unit[0] & 0x1f == 5 {
-                out.extend(&self.params);
-                params_sent = true;
+            let fps = track.frame_rate();
+            let fps = if fps.is_finite() && fps > 1.0 { fps.min(120.0) } else { 30.0 };
+            Ok(Mp4Source {
+                path: path.to_owned(),
+                track_id: track.track_id(),
+                samples: track.sample_count(),
+                frame_time: Duration::from_secs_f64(1.0 / fps),
+                length_size: avcc.length_size_minus_one as usize + 1,
+                params,
+            })
+        }
+
+        /// MP4 stores NAL units with a length prefix; OpenH264 wants start codes. The
+        /// parameter sets live in the file header and are repeated before every key frame.
+        fn to_annex_b(&self, sample: &[u8], out: &mut Vec<u8>) {
+            out.clear();
+            let mut rest = sample;
+            let mut params_sent = false;
+            while rest.len() > self.length_size {
+                let len = rest[..self.length_size].iter().fold(0usize, |a, b| (a << 8) | *b as usize);
+                rest = &rest[self.length_size..];
+                if len == 0 || len > rest.len() {
+                    break;
+                }
+                let unit = &rest[..len];
+                rest = &rest[len..];
+                // before the key frame's picture data (encoders often put an SEI unit first)
+                if !params_sent && unit[0] & 0x1f == 5 {
+                    out.extend(&self.params);
+                    params_sent = true;
+                }
+                out.extend([0, 0, 0, 1]);
+                out.extend(unit);
             }
-            out.extend([0, 0, 0, 1]);
-            out.extend(unit);
         }
     }
-}
 
-fn builtin_loop(src: Mp4Source, fit: Scaling, size: Size, looping: bool, tx: SyncSender<Msg>) {
-    if let Err(e) = builtin_play(&src, fit, size, looping, &tx) {
-        let _ = tx.send(Msg::Error(format!("{e:#}")));
+    pub(super) fn run(src: Mp4Source, fit: Scaling, size: Size, looping: bool, tx: SyncSender<Msg>) {
+        if let Err(e) = builtin_play(&src, fit, size, looping, &tx) {
+            let _ = tx.send(Msg::Error(format!("{e:#}")));
+        }
     }
-}
 
-/// Plays the file (again and again when looping) until the screen is closed (the channel is gone).
-fn builtin_play(src: &Mp4Source, fit: Scaling, size: Size, looping: bool, tx: &SyncSender<Msg>) -> Result<()> {
-    use openh264::decoder::{Decoder, DecoderConfig, Flush};
-    use openh264::formats::YUVSource;
-    let mut scaler = Scaler::default().sized(size);
-    let mut packet = Vec::new();
-    let mut rgba = Vec::new();
-    let mut shown_any = false;
-    let mut emit = |img: &openh264::decoder::DecodedYUV, n: u32, scaler: &mut Scaler| -> bool {
-        let (w, h) = img.dimensions();
-        rgba.resize(w * h * 4, 0);
-        img.write_rgba8(&mut rgba);
-        let frame = scaler
-            .panel_frame(&rgba, w as u32, h as u32, w * 4, Order::Rgba, None, fit)
-            .unwrap_or_else(|| vec![0; size.0 * size.1]);
-        tx.send(Msg::Frame(frame, src.frame_time * n, src.frame_time)).is_ok()
-    };
-    loop {
-        let mut reader = open_mp4(&src.path)?;
-        let config = DecoderConfig::new().flush_after_decode(Flush::NoFlush);
-        let mut decoder = Decoder::with_api_config(openh264::OpenH264API::from_source(), config)
-            .map_err(|e| anyhow!("cannot start the H.264 decoder ({e})"))?;
-        let mut decoded = 0u32;
-        for i in 1..=src.samples {
-            let Some(sample) = reader.read_sample(src.track_id, i).map_err(|e| anyhow!("{e}"))? else { continue };
-            src.to_annex_b(&sample.bytes, &mut packet);
-            // a broken frame is skipped; the next key frame repairs the picture
-            if let Ok(Some(img)) = decoder.decode(&packet) {
+    /// Plays the file (again and again when looping) until the screen is closed (the channel is gone).
+    fn builtin_play(src: &Mp4Source, fit: Scaling, size: Size, looping: bool, tx: &SyncSender<Msg>) -> Result<()> {
+        use openh264::decoder::{Decoder, DecoderConfig, Flush};
+        use openh264::formats::YUVSource;
+        let mut scaler = Scaler::default().sized(size);
+        let mut packet = Vec::new();
+        let mut rgba = Vec::new();
+        let mut shown_any = false;
+        let mut emit = |img: &openh264::decoder::DecodedYUV, n: u32, scaler: &mut Scaler| -> bool {
+            let (w, h) = img.dimensions();
+            rgba.resize(w * h * 4, 0);
+            img.write_rgba8(&mut rgba);
+            let frame = scaler
+                .panel_frame(&rgba, w as u32, h as u32, w * 4, Order::Rgba, None, fit)
+                .unwrap_or_else(|| vec![0; size.0 * size.1]);
+            tx.send(Msg::Frame(frame, src.frame_time * n, src.frame_time)).is_ok()
+        };
+        loop {
+            let mut reader = open_mp4(&src.path)?;
+            let config = DecoderConfig::new().flush_after_decode(Flush::NoFlush);
+            let mut decoder = Decoder::with_api_config(openh264::OpenH264API::from_source(), config)
+                .map_err(|e| anyhow!("cannot start the H.264 decoder ({e})"))?;
+            let mut decoded = 0u32;
+            for i in 1..=src.samples {
+                let Some(sample) = reader.read_sample(src.track_id, i).map_err(|e| anyhow!("{e}"))? else { continue };
+                src.to_annex_b(&sample.bytes, &mut packet);
+                // a broken frame is skipped; the next key frame repairs the picture
+                if let Ok(Some(img)) = decoder.decode(&packet) {
+                    if !emit(&img, decoded, &mut scaler) {
+                        return Ok(());
+                    }
+                    decoded += 1;
+                }
+            }
+            for img in decoder.flush_remaining().unwrap_or_default() {
                 if !emit(&img, decoded, &mut scaler) {
                     return Ok(());
                 }
                 decoded += 1;
             }
-        }
-        for img in decoder.flush_remaining().unwrap_or_default() {
-            if !emit(&img, decoded, &mut scaler) {
+            if decoded > 0 {
+                shown_any = true;
+            } else if !shown_any {
+                bail!("no picture could be decoded (unsupported H.264 variant?)");
+            }
+            if tx.send(Msg::End).is_err() || !looping {
                 return Ok(());
             }
-            decoded += 1;
-        }
-        if decoded > 0 {
-            shown_any = true;
-        } else if !shown_any {
-            bail!("no picture could be decoded (unsupported H.264 variant?)");
-        }
-        if tx.send(Msg::End).is_err() || !looping {
-            return Ok(());
         }
     }
 }
 
 // -- ffmpeg -------------------------------------------------------------------------------
+
+fn start_ffmpeg_decoder(
+    ffmpeg: PathBuf,
+    path: &Path,
+    fit: Scaling,
+    size: Size,
+    looping: bool,
+    tx: SyncSender<Msg>,
+) -> Result<()> {
+    let path = path.to_owned();
+    let child = start_ffmpeg(&ffmpeg, &path, fit, size)?;
+    std::thread::Builder::new()
+        .name("video".into())
+        .spawn(move || ffmpeg_loop(child, &ffmpeg, &path, fit, size, looping, tx))
+        .context("cannot start the video thread")?;
+    Ok(())
+}
 
 pub(crate) fn find_ffmpeg() -> Option<PathBuf> {
     let name = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };

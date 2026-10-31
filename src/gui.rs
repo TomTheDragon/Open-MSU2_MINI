@@ -274,10 +274,12 @@ fn build(cfg: Config, resume_background: bool) {
 
     let video_name = StaticText::builder(&op).with_label(&file_name(&cfg.video)).build();
     let video_btn = Button::builder(&op).with_label("Choose...").build();
-    video_btn.set_tooltip(
+    video_btn.set_tooltip(if cfg!(target_os = "linux") {
+        "Videos are decoded by ffmpeg (install the ffmpeg package)."
+    } else {
         "MP4/MOV with H.264 works directly; other formats\n\
-         (WebM, MKV, AVI, HEVC, ...) need ffmpeg installed.",
-    );
+         (WebM, MKV, AVI, HEVC, ...) need ffmpeg installed."
+    });
     {
         let (h, f, name, radios2) = (handle.clone(), frame, video_name, radios.clone());
         video_btn.on_click(move |_| {
@@ -383,8 +385,16 @@ fn build(cfg: Config, resume_background: bool) {
             .build();
     let fp = fl_box.get_static_box().unwrap();
     let fl_row = BoxSizer::builder(Orientation::Horizontal).build();
-    let album_btn = Button::builder(&fp).with_label("Album image...").build();
-    let anim_btn = Button::builder(&fp).with_label("Offline animation (36 frames)...").build();
+    let album_btn = Button::builder(&fp).with_label("Album picture...").build();
+    album_btn.set_tooltip(
+        "Shown in the \"Album\" mode, i.e. while this program runs.\n\
+         For a picture the device shows on its own, use \"Without PC\".",
+    );
+    let anim_btn = Button::builder(&fp).with_label("Without PC: picture or GIF...").build();
+    anim_btn.set_tooltip(
+        "What the device shows by itself while no PC is connected (also the \"Animation\" mode):\n\
+         a picture, an animated GIF (36 frames are taken from it) or a folder of pictures.",
+    );
     fl_row.add(&album_btn, 0, SizerFlag::Right, 8);
     fl_row.add(&anim_btn, 0, SizerFlag::Right, 0);
     let gauge = Gauge::builder(&fp).with_range(100).build();
@@ -402,15 +412,15 @@ fn build(cfg: Config, resume_background: bool) {
             let src = if animation {
                 let gif = MessageDialog::builder(
                     &f,
-                    "Use an animated GIF?\n\n(No = choose a folder of pictures, e.g. A0.png ... A35.png)",
-                    "Offline animation",
+                    "Use a picture or an animated GIF?\n\n(No = choose a folder of pictures, e.g. A0.png ... A35.png)",
+                    "Shown without PC",
                 )
                 .with_style(MessageDialogStyle::YesNo | MessageDialogStyle::IconQuestion)
                 .build()
                 .show_modal()
                     == ID_YES;
                 if gif {
-                    pick_file(&f, "Choose an animated GIF")
+                    pick_file(&f, "Choose a picture or animated GIF to show without PC")
                 } else {
                     let d = DirDialog::builder(&f, "Choose a folder of pictures", "").build();
                     if d.show_modal() == ID_OK {
@@ -420,7 +430,7 @@ fn build(cfg: Config, resume_background: bool) {
                     }
                 }
             } else {
-                pick_file(&f, "Choose the album picture")
+                pick_file(&f, "Choose the album picture (shown in the Album mode)")
             };
             let Some(src) = src else { return };
             let (fit, rotation) = {

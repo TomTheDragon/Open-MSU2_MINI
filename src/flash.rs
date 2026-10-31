@@ -107,3 +107,20 @@ pub fn write_animation(
     let data: Vec<u8> = animation_frames(source, fit, rotation)?.iter().flat_map(|f| frame_bytes(f)).collect();
     dev.write_flash(FLASH_ANIMATION, &data, progress)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A single picture is stored as 36 equal frames: the device shows it without a PC.
+    #[test]
+    fn still_picture_fills_the_offline_animation() {
+        let path = std::env::temp_dir().join(format!("msu2-still-{}.png", std::process::id()));
+        image::RgbImage::from_fn(320, 160, |x, y| image::Rgb([x as u8, y as u8, 200])).save(&path).unwrap();
+        let frames = animation_frames(&path, Scaling::Crop, 0);
+        let _ = std::fs::remove_file(&path);
+        let frames = frames.unwrap();
+        assert_eq!(frames.len(), ANIM_FRAMES);
+        assert!(frames.iter().all(|f| f == &frames[0]));
+    }
+}

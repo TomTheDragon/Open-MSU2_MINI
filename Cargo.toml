@@ -1,6 +1,6 @@
 [package]
 name = "open-msu2-mini"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2021"
 description = "Open-source driver and control app for the MSU2 / MSU2_MINI 160x80 USB screen"
 license = "MIT"
@@ -24,13 +24,9 @@ ab_glyph = "0.2"
 fast_image_resize = "6"
 sysinfo = "0.40"
 chrono = "0.4"
-# video mode: MP4 container + built-in H.264 decoder
-mp4 = "0.14"
-openh264 = "0.9"
 # appindicator: tray icon via StatusNotifier (KDE, GNOME + extension, Wayland); Linux only
 wxdragon = { version = "0.9", optional = true, default-features = false, features = ["appindicator"] }
 cpal = "0.18"
-symphonia = { version = "0.6", default-features = false, features = ["aac", "isomp4", "mp3", "pcm", "flac", "vorbis", "mkv", "wav", "ogg", "adpcm"] }
 
 [features]
 default = ["gui"]
@@ -46,6 +42,10 @@ windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_Sys
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 xcap = "0.9"
+# video mode (Linux uses the system's ffmpeg instead): MP4 container, H.264 and sound decoders
+mp4 = "0.14"
+openh264 = "0.9"
+symphonia = { version = "0.6", default-features = false, features = ["aac", "isomp4", "mp3", "pcm", "flac", "vorbis", "mkv", "wav", "ogg", "adpcm"] }
 
 [build-dependencies]
 embed-manifest = "1.4"

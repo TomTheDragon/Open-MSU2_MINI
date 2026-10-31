@@ -1,2 +1,3 @@
-# MSU2 / MSU2_MINI USB screen: keep ModemManager away, add /dev/msu2-mini, allow the dialout group.
-SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="fe0c", ENV{ID_MM_DEVICE_IGNORE}="1", SYMLINK+="msu2-mini", MODE="0660", GROUP="dialout"
+# MSU2 / MSU2_MINI USB screen: keep ModemManager away, add /dev/msu2-mini, and give the
+# logged-in desktop user access (uaccess), so no dialout / uucp group membership is needed.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="fe0c", ENV{ID_MM_DEVICE_IGNORE}="1", SYMLINK+="msu2-mini", TAG+="uaccess"

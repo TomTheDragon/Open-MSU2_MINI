@@ -2,7 +2,8 @@
 # Install Open MSU2_MINI for the current user (no root needed).
 #   packaging/linux/install.sh [BINARY]   install (default BINARY: dist/open-msu2-mini-linux-x86_64)
 #   ... --autostart                       also start in the background after login
-#   ... --udev                            also stop ModemManager from probing the device (sudo)
+#   ... --udev                            also install a udev rule (sudo): device access for the
+#                                         logged-in user, no ModemManager probing
 #   packaging/linux/install.sh --uninstall
 set -e
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -45,5 +46,17 @@ if [ $RULE = 1 ]; then
     sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=tty
     echo "udev rule installed."
 fi
-id -nG | grep -qw dialout || echo "NOTE: add yourself to the 'dialout' group: sudo usermod -aG dialout $USER (then log in again)"
+
+# missing system libraries / ffmpeg (package names: see "Install" in README.md)
+MISSING=$(ldd "$BIN" 2>/dev/null | awk '/not found/ {print $1}' | tr '\n' ' ')
+[ -n "$MISSING" ] && echo "WARNING: missing libraries: $MISSING- install them as shown under \"Install\" in README.md"
+command -v ffmpeg >/dev/null || echo "NOTE: install ffmpeg to play videos (see \"Install\" in README.md)"
+
+# serial port access: the udev rule, or the group that owns serial ports (dialout; uucp on Arch)
+if [ ! -f "$UDEV" ]; then
+    GROUP=dialout
+    getent group dialout >/dev/null || GROUP=uucp
+    id -nG | grep -qw "$GROUP" ||
+        echo "NOTE: for access to the device, run this again with --udev, or: sudo usermod -aG $GROUP $USER (then log in again)"
+fi
 echo "Installed. Start 'Open MSU2_MINI' from the app menu or run: open-msu2-mini --help"
