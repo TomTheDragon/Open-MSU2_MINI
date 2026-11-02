@@ -1,6 +1,6 @@
 //! Customisable system monitor.
 
-use crate::config::{StatGraphic, StatItem, StatsConfig, ValuePosition};
+use crate::config::{DiskSelect, StatEntry, StatGraphic, StatItem, StatsConfig, ValuePosition};
 use crate::device::Frame565;
 use crate::render::{blank, bold, regular, text, text_inverted, text_width, Anchor, Screen, Size, Style};
 use crate::scale::rgb_to_565;
@@ -29,6 +29,10 @@ unsafe impl Send for GpuList {}
 /// One line on the panel.
 struct Row {
     item: StatItem,
+    /// Label on the panel
+    label: String,
+    /// Position in the list, for the history
+    index: usize,
     value: String,
     /// 0..1 for bars and graphs
     frac: Option<f32>,
@@ -53,14 +57,15 @@ pub struct StatsScreen {
     comps_searched: Option<Instant>,
     last: Instant,
     started: Instant,
-    history: HashMap<StatItem, VecDeque<f32>>,
+    /// by row position: disk values can be shown more than once
+    history: HashMap<usize, VecDeque<f32>>,
 }
 
 impl StatsScreen {
     pub fn new(cfg: StatsConfig, size: Size) -> Self {
         let mut sys = System::new().expect("system information not available");
         sys.refresh_cpu_usage();
-        let wants_gpu = cfg.items.iter().any(|i| matches!(i, StatItem::Gpu | StatItem::GpuTemp | StatItem::Vram));
+        let wants_gpu = cfg.items.iter().any(|e| matches!(e.item, StatItem::Gpu | StatItem::GpuTemp | StatItem::Vram));
         let amd_gpu = if wants_gpu { amd_gpu_dir() } else { None };
         let gpus =
             (wants_gpu && amd_gpu.is_none()).then(|| Gpus::new_with_refreshed_list().ok().map(GpuList)).flatten();
@@ -154,7 +159,7 @@ impl StatsScreen {
 
     fn collect(&mut self) -> Vec<Row> {
         let items = self.cfg.items.clone();
-        let has = |i: StatItem| items.contains(&i);
+        let has = |i: StatItem| items.iter().any(|e| e.item == i);
         let dt = self.last.elapsed().as_secs_f64().max(0.1);
         self.last = Instant::now();
 
@@ -165,7 +170,8 @@ impl StatsScreen {
         if has(StatItem::Ram) || has(StatItem::Swap) {
             self.sys.refresh_memory();
         }
-        if items.iter().any(|i| matches!(i, StatItem::Cpu | StatItem::CpuTemp | StatItem::Gpu | StatItem::GpuTemp)) {
+        if items.iter().any(|e| matches!(e.item, StatItem::Cpu | StatItem::CpuTemp | StatItem::Gpu | StatItem::GpuTemp))
+        {
             // with no sensors found, sysinfo searches again on every refresh (on Windows a
             // WMI query that needs admin rights); do that at most once a minute
             let search_due = self.comps_searched.is_none_or(|t| t.elapsed() >= Duration::from_secs(60));
@@ -182,12 +188,13 @@ impl StatsScreen {
             self.nets.refresh(false);
         }
         if has(StatItem::Disk) || has(StatItem::DiskIo) {
-            self.disks.refresh(false);
+            // also picks up drives plugged in later and drops removed ones
+            self.disks.refresh(true);
         }
         if has(StatItem::Processes) {
             self.sys.refresh_processes(ProcessesToUpdate::All, true);
         }
-        let gpu = if items.iter().any(|i| matches!(i, StatItem::Gpu | StatItem::GpuTemp | StatItem::Vram)) {
+        let gpu = if items.iter().any(|e| matches!(e.item, StatItem::Gpu | StatItem::GpuTemp | StatItem::Vram)) {
             self.gpu()
         } else {
             GpuInfo::default()
@@ -195,8 +202,9 @@ impl StatsScreen {
         let with_temp = self.cfg.temp_with_usage;
 
         let mut rows = Vec::new();
-        for item in items {
-            let mut row = Row { item, value: "n/a".into(), frac: None, multi: None };
+        for (index, entry) in items.into_iter().enumerate() {
+            let item = entry.item;
+            let mut row = Row { item, label: entry.short(), index, value: "n/a".into(), frac: None, multi: None };
             match item {
                 StatItem::Cpu => {
                     let u = self.cpu_usage();
@@ -263,18 +271,22 @@ impl StatsScreen {
                     }
                 }
                 StatItem::Disk => {
-                    if let Some(d) = main_disk(&self.disks) {
-                        let used = d.total_space() - d.available_space();
-                        row.value = fmt_used(used, d.total_space());
-                        row.frac = Some(used as f32 / d.total_space().max(1) as f32);
+                    let sel = selected_disks(&self.disks, &entry.drive);
+                    let total: u64 = sel.iter().map(|d| d.total_space()).sum();
+                    if total > 0 {
+                        let used = sel.iter().map(|d| d.total_space().saturating_sub(d.available_space())).sum::<u64>();
+                        row.value = fmt_used(used, total);
+                        row.frac = Some(used as f32 / total as f32);
                     }
                 }
                 StatItem::DiskIo => {
-                    let (r, w) = self
-                        .disks
-                        .iter()
-                        .fold((0u64, 0u64), |a, d| (a.0 + d.usage().read_bytes, a.1 + d.usage().written_bytes));
-                    row.value = format!("R{} W{}", fmt_rate(r as f64 / dt), fmt_rate(w as f64 / dt));
+                    let sel = selected_disks(&self.disks, &entry.drive);
+                    if !sel.is_empty() {
+                        let (r, w) = sel
+                            .iter()
+                            .fold((0u64, 0u64), |a, d| (a.0 + d.usage().read_bytes, a.1 + d.usage().written_bytes));
+                        row.value = format!("R{} W{}", fmt_rate(r as f64 / dt), fmt_rate(w as f64 / dt));
+                    }
                 }
                 StatItem::Net => {
                     let (d, u) =
@@ -307,7 +319,7 @@ impl StatsScreen {
                 StatItem::Time => row.value = chrono::Local::now().format("%H:%M:%S").to_string(),
             }
             if let Some(f) = row.frac {
-                let h = self.history.entry(item).or_default();
+                let h = self.history.entry(index).or_default();
                 h.push_back(f.clamp(0.0, 1.0));
                 while h.len() > HISTORY {
                     h.pop_front();
@@ -372,7 +384,7 @@ impl StatsScreen {
             }
             StatGraphic::Histogram => {
                 draw_filled_rect_mut(img, Rect::at(x, y).of_size(w as u32, h as u32), Rgb([25, 25, 30]));
-                if let Some(hist) = self.history.get(&row.item) {
+                if let Some(hist) = self.history.get(&row.index) {
                     let skip = hist.len().saturating_sub(iw as usize);
                     let start = ix + iw - (hist.len() - skip) as i32;
                     for (i, v) in hist.iter().skip(skip).enumerate() {
@@ -463,7 +475,7 @@ impl Screen for StatsScreen {
         let gap = self.cfg.label_gap.min(40) as i32;
         // landscape label column: as wide as the widest label of all pages, so rows line up
         let label_fs = (rh as f32 * 0.62).clamp(8.0, 24.0);
-        let label_col = rows.iter().map(|r| text_width(r.item.short(), label_fs, bold())).max().unwrap_or(0);
+        let label_col = rows.iter().map(|r| text_width(r.label.as_str(), label_fs, bold())).max().unwrap_or(0);
 
         for (i, row) in visible.iter().enumerate() {
             let y0 = i as i32 * rh;
@@ -471,10 +483,10 @@ impl Screen for StatsScreen {
                 // label on top; graphic and value on the line underneath
                 let fs = (rh as f32 * 0.45).clamp(8.0, 13.0);
                 let ty = y0 + (rh as f32 * 0.32) as i32;
-                text(&mut img, row.item.short(), 1, ty, Style::new(fs, bold(), accent));
+                text(&mut img, row.label.as_str(), 1, ty, Style::new(fs, bold(), accent));
                 if !self.has_viz(row) {
                     // no graphic: the value goes on the label's line
-                    let x0 = 1 + text_width(row.item.short(), fs, bold()) + gap;
+                    let x0 = 1 + text_width(row.label.as_str(), fs, bold()) + gap;
                     self.draw_body(&mut img, row, (x0, w - 1), ty, (0, 0), fs * 0.95);
                     continue;
                 }
@@ -488,7 +500,7 @@ impl Screen for StatsScreen {
             } else {
                 let fs = label_fs;
                 let cy = y0 + rh / 2;
-                text(&mut img, row.item.short(), 2, cy, Style::new(fs, bold(), accent));
+                text(&mut img, row.label.as_str(), 2, cy, Style::new(fs, bold(), accent));
                 let tall = (rh - 4).max(4);
                 let bar = (rh - 8).clamp(4, 12);
                 self.draw_body(&mut img, row, (2 + label_col + gap, w - 2), cy, (tall, bar), fs * 0.85);
@@ -537,12 +549,70 @@ fn fmt_rate(mut bps: f64) -> String {
     unreachable!()
 }
 
+fn system_mount() -> &'static str {
+    if cfg!(windows) {
+        "C:\\"
+    } else {
+        "/"
+    }
+}
+
 fn main_disk(disks: &Disks) -> Option<&sysinfo::Disk> {
-    let root = if cfg!(windows) { "C:\\" } else { "/" };
     disks
         .iter()
-        .find(|d| d.mount_point().to_string_lossy() == root)
+        .find(|d| d.mount_point().to_string_lossy() == system_mount())
         .or_else(|| disks.iter().max_by_key(|d| d.total_space()))
+}
+
+/// Real drives, one entry per device: a partition is often mounted at several places
+/// (btrfs subvolumes, bind mounts); the shortest mount point stands for it.
+fn real_disks(disks: &Disks) -> Vec<&sysinfo::Disk> {
+    let mut out: Vec<&sysinfo::Disk> = Vec::new();
+    for d in disks.iter() {
+        let fs = d.file_system().to_string_lossy().to_lowercase();
+        if d.total_space() == 0 || fs == "squashfs" || fs.starts_with("fuse.") {
+            continue;
+        }
+        let len = |d: &sysinfo::Disk| d.mount_point().as_os_str().len();
+        // Windows: the name is the volume label, which can be empty or repeat
+        let same = |o: &&sysinfo::Disk| !cfg!(windows) && !d.name().is_empty() && o.name() == d.name();
+        match out.iter_mut().find(|o| same(o)) {
+            Some(o) if len(d) < len(o) => *o = d,
+            Some(_) => {}
+            None => out.push(d),
+        }
+    }
+    out.sort_by(|a, b| a.mount_point().cmp(b.mount_point()));
+    out
+}
+
+/// The drives the disk values add up.
+fn selected_disks<'a>(disks: &'a Disks, sel: &DiskSelect) -> Vec<&'a sysinfo::Disk> {
+    match sel {
+        DiskSelect::System => main_disk(disks).into_iter().collect(),
+        DiskSelect::All => real_disks(disks),
+        DiskSelect::Mount(m) => disks.iter().filter(|d| d.mount_point().to_string_lossy() == *m).take(1).collect(),
+    }
+}
+
+/// Drives for the settings dialog: (mount point, description)
+pub fn drive_choices() -> Vec<(String, String)> {
+    let Ok(disks) = Disks::new_with_refreshed_list() else { return Vec::new() };
+    real_disks(&disks)
+        .into_iter()
+        .map(|d| {
+            let mount = d.mount_point().to_string_lossy().into_owned();
+            let name = d.name().to_string_lossy();
+            let name = name.trim_start_matches("/dev/");
+            let size = fmt_used(d.total_space() - d.available_space().min(d.total_space()), d.total_space());
+            let desc = if name.is_empty() || name == mount {
+                format!("{mount}   ({size})")
+            } else {
+                format!("{mount}   ({name}, {size})")
+            };
+            (mount, desc)
+        })
+        .collect()
 }
 
 /// CPU load on Windows from NtQuerySystemInformation, like Task Manager. sysinfo uses
@@ -707,7 +777,7 @@ fn battery() -> Option<(f32, bool)> {
 
 /// `open-msu2-mini sysinfo`: every value, read three times, with the time each read takes.
 pub fn print_values() {
-    let cfg = StatsConfig { items: StatItem::ALL.to_vec(), ..Default::default() };
+    let cfg = StatsConfig { items: StatItem::ALL.map(StatEntry::new).to_vec(), ..Default::default() };
     let t = Instant::now();
     let mut s = StatsScreen::new(cfg, crate::device::canvas_size(0));
     println!("start: {} ms", t.elapsed().as_millis());
@@ -748,7 +818,7 @@ mod tests {
     #[test]
     fn render_all_layouts() {
         let dir = std::env::var_os("PREVIEW_DIR").map(PathBuf::from);
-        let all = StatsConfig { items: StatItem::ALL.to_vec(), rows: 0, ..Default::default() };
+        let all = StatsConfig { items: StatItem::ALL.map(StatEntry::new).to_vec(), rows: 0, ..Default::default() };
         let few = StatsConfig::default();
         for rotation in [0u16, 90] {
             let size = canvas_size(rotation);
@@ -793,7 +863,11 @@ mod tests {
         let mut screens: Vec<(u16, StatsScreen)> = Vec::new();
         for rotation in [0u16, 90] {
             let size = canvas_size(rotation);
-            let all = StatsConfig { items: StatItem::ALL.to_vec(), page_seconds: 100_000, ..Default::default() };
+            let all = StatsConfig {
+                items: StatItem::ALL.map(StatEntry::new).to_vec(),
+                page_seconds: 100_000,
+                ..Default::default()
+            };
             let middle = if rotation == 0 {
                 StatsConfig { graphic: StatGraphic::Histogram, outline: false, ..all }
             } else {

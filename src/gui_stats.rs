@@ -1,12 +1,26 @@
 //! Settings dialog for the system monitor.
 
-use crate::config::{StatGraphic, StatItem, StatsConfig, ValuePosition};
+use crate::config::{DiskSelect, StatEntry, StatGraphic, StatItem, StatsConfig, ValuePosition};
 use std::cell::RefCell;
 use std::rc::Rc;
 use wxdragon::prelude::*;
 
 const ROW_CHOICES: [u32; 9] = [0, 1, 2, 3, 4, 5, 6, 7, 8];
 const INTERVALS_MS: [u32; 6] = [250, 500, 1000, 2000, 5000, 10000];
+
+/// What to select after the lists are filled
+enum Sel {
+    None,
+    /// row in the shown list
+    Shown(usize),
+    /// value in the available list
+    Avail(StatItem),
+}
+
+/// Values that can still be added; disk values can be added again for another drive.
+fn available(shown: &[StatEntry]) -> Vec<StatItem> {
+    StatItem::ALL.into_iter().filter(|i| i.has_drive() || !shown.iter().any(|e| e.item == *i)).collect()
+}
 
 /// Show the dialog; returns the new settings, or None when cancelled.
 pub fn customize(parent: &dyn WxWidget, current: &StatsConfig) -> Option<StatsConfig> {
@@ -24,41 +38,88 @@ pub fn customize(parent: &dyn WxWidget, current: &StatsConfig) -> Option<StatsCo
 
     let shown = Rc::new(RefCell::new(current.items.clone()));
     let lists = BoxSizer::builder(Orientation::Horizontal).build();
-    let list_size = Size::new(190, 300);
+    let list_size = Size::new(220, 300);
     let shown_list = ListBox::builder(&ib).with_size(list_size).build();
     let avail_list = ListBox::builder(&ib).with_size(list_size).build();
-    // fill both lists; `sel` selects an entry in the shown (true) or available list
-    let refill = {
-        let shown = shown.clone();
-        Rc::new(move |sel: Option<(bool, StatItem)>| {
-            let s = shown.borrow();
-            let avail: Vec<StatItem> = StatItem::ALL.into_iter().filter(|i| !s.contains(i)).collect();
-            shown_list.clear();
-            for i in s.iter() {
-                shown_list.append(i.name());
+
+    // drive of the selected disk row
+    let mut drives: Vec<(DiskSelect, String)> =
+        vec![(DiskSelect::System, "System drive".to_string()), (DiskSelect::All, "All drives together".to_string())];
+    drives.extend(crate::stats::drive_choices().into_iter().map(|(m, d)| (DiskSelect::Mount(m), d)));
+    // keep chosen drives that are not connected right now
+    for e in &current.items {
+        if let DiskSelect::Mount(m) = &e.drive {
+            if !drives.iter().any(|(s, _)| *s == e.drive) {
+                drives.push((e.drive.clone(), format!("{m}   (not found)")));
             }
-            avail_list.clear();
-            for i in &avail {
-                avail_list.append(i.name());
-            }
+        }
+    }
+    let drives = Rc::new(drives);
+    let drive = Choice::builder(&ib).with_choices(drives.iter().map(|(_, d)| d.clone()).collect()).build();
+    drive.set_tooltip(
+        "Drive or partition for the selected \"Disk space\" or \"Disk read/write speed\" row.\n\
+         Add these values several times to show several drives.",
+    );
+    drive.enable(false);
+    let sync_drive = {
+        let (shown, drives) = (shown.clone(), drives.clone());
+        Rc::new(move || {
+            let sel = shown_list.get_selection().and_then(|i| shown.borrow().get(i as usize).cloned());
             match sel {
-                Some((true, item)) => {
-                    if let Some(p) = s.iter().position(|i| *i == item) {
-                        shown_list.set_selection(p as u32, true);
-                    }
+                Some(e) if e.has_drive() => {
+                    drive.enable(true);
+                    drive.set_selection(drives.iter().position(|(s, _)| *s == e.drive).unwrap_or(0) as u32);
                 }
-                Some((false, item)) => {
-                    if let Some(p) = avail.iter().position(|i| *i == item) {
-                        avail_list.set_selection(p as u32, true);
-                    }
-                }
-                None => {}
+                _ => drive.enable(false),
             }
         })
     };
-    refill(None);
-    let selected_avail = move |shown: &[StatItem]| {
-        let avail: Vec<StatItem> = StatItem::ALL.into_iter().filter(|i| !shown.contains(i)).collect();
+
+    // fill both lists and select an entry in one of them
+    let refill = {
+        let (shown, sync_drive) = (shown.clone(), sync_drive.clone());
+        Rc::new(move |sel: Sel| {
+            {
+                let s = shown.borrow();
+                let avail = available(&s);
+                shown_list.clear();
+                for e in s.iter() {
+                    shown_list.append(&e.name());
+                }
+                avail_list.clear();
+                for i in &avail {
+                    avail_list.append(i.name());
+                }
+                match sel {
+                    Sel::Shown(p) if p < s.len() => shown_list.set_selection(p as u32, true),
+                    Sel::Avail(item) => {
+                        if let Some(p) = avail.iter().position(|i| *i == item) {
+                            avail_list.set_selection(p as u32, true);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            sync_drive();
+        })
+    };
+    refill(Sel::None);
+    {
+        let s = sync_drive.clone();
+        shown_list.on_selection_changed(move |_| s());
+    }
+    {
+        let (shown, refill, drives) = (shown.clone(), refill.clone(), drives.clone());
+        drive.on_selection_changed(move |e| {
+            let (Some(row), Some(d)) = (shown_list.get_selection(), e.get_selection()) else { return };
+            if let Some(entry) = shown.borrow_mut().get_mut(row as usize) {
+                entry.drive = drives[d as usize].0.clone();
+            }
+            refill(Sel::Shown(row as usize));
+        });
+    }
+    let selected_avail = move |shown: &[StatEntry]| {
+        let avail = available(shown);
         avail_list.get_selection().and_then(|i| avail.get(i as usize).copied())
     };
     let add = {
@@ -66,8 +127,9 @@ pub fn customize(parent: &dyn WxWidget, current: &StatsConfig) -> Option<StatsCo
         Rc::new(move || {
             let item = selected_avail(&shown.borrow());
             if let Some(item) = item {
-                shown.borrow_mut().push(item);
-                refill(Some((true, item)));
+                shown.borrow_mut().push(StatEntry::new(item));
+                let last = shown.borrow().len() - 1;
+                refill(Sel::Shown(last));
             }
         })
     };
@@ -75,8 +137,8 @@ pub fn customize(parent: &dyn WxWidget, current: &StatsConfig) -> Option<StatsCo
         let (shown, refill) = (shown.clone(), refill.clone());
         Rc::new(move || {
             let Some(i) = shown_list.get_selection() else { return };
-            let item = shown.borrow_mut().remove(i as usize);
-            refill(Some((false, item)));
+            let entry = shown.borrow_mut().remove(i as usize);
+            refill(Sel::Avail(entry.item));
         })
     };
     let buttons_col = BoxSizer::builder(Orientation::Vertical).build();
@@ -94,8 +156,7 @@ pub fn customize(parent: &dyn WxWidget, current: &StatsConfig) -> Option<StatsCo
                 return;
             }
             shown.borrow_mut().swap(sel as usize, target as usize);
-            let item = shown.borrow()[target as usize];
-            refill(Some((true, item)));
+            refill(Sel::Shown(target as usize));
         });
     }
     {
@@ -119,6 +180,11 @@ pub fn customize(parent: &dyn WxWidget, current: &StatsConfig) -> Option<StatsCo
     lists.add_sizer(&buttons_col, 0, SizerFlag::Left | SizerFlag::Right, 6);
     lists.add(&avail_list, 1, SizerFlag::Expand, 0);
     items_box.add_sizer(&lists, 1, SizerFlag::Expand | SizerFlag::All, 4);
+    let drive_row = BoxSizer::builder(Orientation::Horizontal).build();
+    let drive_label = StaticText::builder(&ib).with_label("Drive of the selected disk row:").build();
+    drive_row.add(&drive_label, 0, SizerFlag::AlignCenterVertical | SizerFlag::Right, 6);
+    drive_row.add(&drive, 1, SizerFlag::AlignCenterVertical, 0);
+    items_box.add_sizer(&drive_row, 0, SizerFlag::Expand | SizerFlag::All, 4);
     root.add_sizer(&items_box, 1, SizerFlag::Expand | SizerFlag::All, pad);
 
     // -- look ---------------------------------------------------------------------------

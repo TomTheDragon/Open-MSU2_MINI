@@ -66,7 +66,10 @@ pub struct Config {
     /// Start the video again at the end (otherwise its last picture stays)
     pub video_loop: bool,
     pub clock_background: Option<PathBuf>,
+    /// Serial port of the chosen device; None = the first one found
     pub port: Option<String>,
+    /// USB serial number of the chosen device, if it has one (the port name can change)
+    pub device_serial: Option<String>,
     pub stats: StatsConfig,
     /// Icon of the control window: taskbar, notification area or both
     pub tray_icon: TrayIcon,
@@ -94,6 +97,7 @@ impl Default for Config {
             video_loop: true,
             clock_background: None,
             port: None,
+            device_serial: None,
             stats: StatsConfig::default(),
             tray_icon: TrayIcon::Taskbar,
             start_minimized: false,
@@ -209,6 +213,10 @@ impl StatItem {
         StatItem::Uptime,
         StatItem::Time,
     ];
+    /// Disk values can be shown for a chosen drive
+    pub fn has_drive(self) -> bool {
+        matches!(self, StatItem::Disk | StatItem::DiskIo)
+    }
     /// Name in the settings dialog
     pub fn name(self) -> &'static str {
         match self {
@@ -314,8 +322,8 @@ impl ValuePosition {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StatsConfig {
-    /// Shown items, in this order
-    pub items: Vec<StatItem>,
+    /// Shown rows, in this order
+    pub items: Vec<StatEntry>,
     pub graphic: StatGraphic,
     pub value_position: ValuePosition,
     /// Grey frame around bars and histograms
@@ -340,10 +348,92 @@ pub struct StatsConfig {
     pub fahrenheit: bool,
 }
 
+/// Which drive the disk values show
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DiskSelect {
+    /// The drive the system runs from (`/` or `C:\`)
+    #[default]
+    System,
+    /// All drives together
+    All,
+    /// The drive mounted here (e.g. `/home` or `D:\`)
+    Mount(String),
+}
+
+impl DiskSelect {
+    /// Short name on the panel, e.g. "HOME" for `/home` or "D:" for `D:\`; None for the
+    /// system drive and all drives, which keep the normal label
+    pub fn short(&self) -> Option<String> {
+        let DiskSelect::Mount(m) = self else { return None };
+        let m = m.trim_end_matches(['/', '\\']);
+        let name = m.rsplit(['/', '\\']).next().unwrap_or(m);
+        (!name.is_empty()).then(|| name.to_uppercase().chars().take(5).collect())
+    }
+}
+
+/// One row of the system monitor. Disk rows can each show a different drive, so the same
+/// value can be shown more than once.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "EntryRepr", into = "EntryRepr")]
+pub struct StatEntry {
+    pub item: StatItem,
+    /// Only used by `Disk` and `DiskIo`
+    pub drive: DiskSelect,
+}
+
+/// Saved as just the value ("cpu") unless a drive is chosen, so older settings still load.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum EntryRepr {
+    Plain(StatItem),
+    WithDrive { item: StatItem, drive: DiskSelect },
+}
+
+impl From<EntryRepr> for StatEntry {
+    fn from(r: EntryRepr) -> Self {
+        match r {
+            EntryRepr::Plain(item) => StatEntry::new(item),
+            EntryRepr::WithDrive { item, drive } => StatEntry { item, drive },
+        }
+    }
+}
+
+impl From<StatEntry> for EntryRepr {
+    fn from(e: StatEntry) -> Self {
+        if e.drive == DiskSelect::System {
+            EntryRepr::Plain(e.item)
+        } else {
+            EntryRepr::WithDrive { item: e.item, drive: e.drive }
+        }
+    }
+}
+
+impl StatEntry {
+    pub fn new(item: StatItem) -> Self {
+        StatEntry { item, drive: DiskSelect::System }
+    }
+    pub fn has_drive(&self) -> bool {
+        self.item.has_drive()
+    }
+    /// Name in the settings dialog
+    pub fn name(&self) -> String {
+        match (&self.drive, self.has_drive()) {
+            (DiskSelect::Mount(m), true) => format!("{}: {m}", self.item.name()),
+            (DiskSelect::All, true) => format!("{}: all drives", self.item.name()),
+            _ => self.item.name().to_string(),
+        }
+    }
+    /// Label on the panel
+    pub fn short(&self) -> String {
+        self.has_drive().then(|| self.drive.short()).flatten().unwrap_or_else(|| self.item.short().to_string())
+    }
+}
+
 impl Default for StatsConfig {
     fn default() -> Self {
         StatsConfig {
-            items: vec![StatItem::Cpu, StatItem::Gpu, StatItem::Ram, StatItem::Net],
+            items: [StatItem::Cpu, StatItem::Gpu, StatItem::Ram, StatItem::Net].map(StatEntry::new).to_vec(),
             graphic: StatGraphic::Bars,
             value_position: ValuePosition::Behind,
             outline: true,
@@ -491,5 +581,35 @@ pub fn kill_background(pid: u32) {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stat_rows_with_drives_load_and_save() {
+        // settings from before drives could be chosen
+        let old: StatsConfig = serde_json::from_str(r#"{"items":["cpu","disk","disk_io"]}"#).unwrap();
+        assert_eq!(old.items, [StatItem::Cpu, StatItem::Disk, StatItem::DiskIo].map(StatEntry::new));
+
+        let cfg = StatsConfig {
+            items: vec![
+                StatEntry { item: StatItem::DiskIo, drive: DiskSelect::Mount("/".into()) },
+                StatEntry { item: StatItem::Disk, drive: DiskSelect::Mount("/mnt/backup".into()) },
+                StatEntry { item: StatItem::Disk, drive: DiskSelect::All },
+                StatEntry::new(StatItem::Ram),
+            ],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains(r#""ram""#), "plain rows stay plain: {json}");
+        let back: StatsConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.items, cfg.items);
+
+        assert_eq!(cfg.items[1].short(), "BACKU");
+        assert_eq!(cfg.items[0].short(), "I/O");
+        assert_eq!(DiskSelect::Mount("D:\\".into()).short().as_deref(), Some("D:"));
     }
 }

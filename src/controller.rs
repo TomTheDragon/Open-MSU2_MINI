@@ -31,6 +31,7 @@ pub struct Handle {
     pub status: Arc<Mutex<Status>>,
     changed: Arc<AtomicBool>,
     reselect: Arc<AtomicBool>,
+    reconnect: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     jobs: mpsc::Sender<(Job, JobDone)>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -47,6 +48,14 @@ impl Handle {
     pub fn reselect_screen(&self) {
         self.reselect.store(true, Ordering::SeqCst);
         self.update(|c| c.mode = Mode::Mirror);
+    }
+    /// Use another device (None = the first one found); connects to it right away.
+    pub fn set_device(&self, port: Option<String>, serial: Option<String>) {
+        self.reconnect.store(true, Ordering::SeqCst);
+        self.update(|c| {
+            c.port = port;
+            c.device_serial = serial;
+        });
     }
     pub fn run_job(&self, job: Job, done: JobDone) {
         let _ = self.jobs.send((job, done));
@@ -73,6 +82,7 @@ pub fn spawn(cfg: Config, use_button: bool, on_status: impl Fn(&Status) + Send +
     let status = Arc::new(Mutex::new(Status::default()));
     let changed = Arc::new(AtomicBool::new(true));
     let reselect = Arc::new(AtomicBool::new(false));
+    let reconnect = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
     let mut c = Controller {
@@ -80,6 +90,7 @@ pub fn spawn(cfg: Config, use_button: bool, on_status: impl Fn(&Status) + Send +
         status: status.clone(),
         changed: changed.clone(),
         reselect: reselect.clone(),
+        reconnect: reconnect.clone(),
         stop: stop.clone(),
         jobs: rx,
         on_status: Box::new(on_status),
@@ -100,7 +111,7 @@ pub fn spawn(cfg: Config, use_button: bool, on_status: impl Fn(&Status) + Send +
         dimmer: None,
     };
     let thread = std::thread::Builder::new().name("controller".into()).spawn(move || c.run()).unwrap();
-    Handle { cfg, status, changed, reselect, stop, jobs: tx, thread: Some(thread) }
+    Handle { cfg, status, changed, reselect, reconnect, stop, jobs: tx, thread: Some(thread) }
 }
 
 #[derive(Default)]
@@ -115,6 +126,7 @@ struct Controller {
     status: Arc<Mutex<Status>>,
     changed: Arc<AtomicBool>,
     reselect: Arc<AtomicBool>,
+    reconnect: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     jobs: mpsc::Receiver<(Job, JobDone)>,
     on_status: Box<dyn Fn(&Status) + Send>,
@@ -215,9 +227,18 @@ impl Controller {
     }
 
     fn tick(&mut self) -> anyhow::Result<()> {
+        if self.reconnect.swap(false, Ordering::SeqCst) {
+            if let Some(mut d) = self.dev.take() {
+                let _ = d.flush();
+            }
+            self.shown = None;
+        }
         if self.dev.is_none() {
-            let port = self.cfg.lock().unwrap().port.clone();
-            let d = Device::open(port.as_deref())?;
+            let (port, serial) = {
+                let c = self.cfg.lock().unwrap();
+                (c.port.clone(), c.device_serial.clone())
+            };
+            let d = Device::open_chosen(port.as_deref(), serial.as_deref())?;
             let text = format!(
                 "connected ({}, firmware v{})",
                 d.port_name,

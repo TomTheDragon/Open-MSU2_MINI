@@ -10,6 +10,8 @@ It replaces the vendor's Windows-only demo tool and runs on **Linux, Windows and
   temperatures, RAM, swap, disk space and speed, network, battery, load, processes, uptime and
   time. Each with a bar, a history graph (histogram) or no graphic, the number before,
   behind or on top of it, in any order, with pages when they don't fit on one screen.
+  Disk space and disk speed can be shown for any drive or partition, several times (e.g.
+  the speed of one drive and how full another one is).
 - **Clock**, **pictures** and **animated GIFs**.
 - **Brightness** from 10 % to 100 % (the picture is darkened: the MSU2_MINI's firmware has
   no backlight control, see [Protocol](#protocol)).
@@ -26,6 +28,7 @@ It replaces the vendor's Windows-only demo tool and runs on **Linux, Windows and
 - **Native window** that follows your desktop theme: GTK on Linux, Win32 with dark mode on
   Windows, Cocoa on macOS. Optionally with an icon in the notification area (system tray)
   and started minimized.
+- **Several screens connected?** Choose which one to use from the device list.
 - **Command line** for running without a window (autostart), flashing and benchmarking.
 
 ![System monitor (bars and history graphs) and clock in landscape](docs/screens-landscape.png)

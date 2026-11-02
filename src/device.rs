@@ -59,26 +59,64 @@ pub fn rgb565(r: u8, g: u8, b: u8) -> u16 {
     ((r as u16 >> 3) << 11) | ((g as u16 >> 2) << 5) | (b as u16 >> 3)
 }
 
-/// Find serial ports that belong to an MSU2 device (best match first).
-pub fn find_ports() -> Vec<String> {
+/// A serial port that may be an MSU2 device.
+#[derive(Clone, Debug)]
+pub struct PortInfo {
+    pub name: String,
+    /// USB serial number, if the device has one; stays the same when the port name changes
+    pub serial: Option<String>,
+    /// Matches the MSU2's USB IDs (otherwise just some USB serial port)
+    pub exact: bool,
+}
+
+impl PortInfo {
+    /// Text for the device list
+    pub fn describe(&self) -> String {
+        let name = self.name.trim_start_matches("/dev/");
+        match &self.serial {
+            Some(s) => format!("{name}   (serial {s})"),
+            None => name.to_string(),
+        }
+    }
+}
+
+/// Serial ports that belong to an MSU2 device (best match first). When none matches the
+/// MSU2's USB IDs, all USB serial ports.
+pub fn list_ports() -> Vec<PortInfo> {
     let mut exact = Vec::new();
     let mut other = Vec::new();
     if let Ok(ports) = serialport::available_ports() {
         for p in ports {
-            match &p.port_type {
-                SerialPortType::UsbPort(u) if u.vid == USB_VID && u.pid == USB_PID => exact.push(p.port_name),
-                SerialPortType::UsbPort(_) => other.push(p.port_name),
-                _ => {}
+            if let SerialPortType::UsbPort(u) = &p.port_type {
+                let is_msu2 = u.vid == USB_VID && u.pid == USB_PID;
+                let serial = u.serial_number.clone().filter(|s| !s.trim().is_empty());
+                let info = PortInfo { name: p.port_name, serial, exact: is_msu2 };
+                if is_msu2 {
+                    exact.push(info)
+                } else {
+                    other.push(info)
+                }
             }
         }
     }
     // macOS lists both tty.* and cu.*; cu.* is the one to use for outgoing connections.
-    exact.sort_by_key(|n| !n.contains("/cu."));
+    // Each device shows up once in the list: drop a tty.* that has a cu.* twin.
+    if cfg!(target_os = "macos") {
+        for list in [&mut exact, &mut other] {
+            let names: Vec<String> = list.iter().map(|p| p.name.clone()).collect();
+            list.retain(|p| !p.name.contains("/tty.") || !names.contains(&p.name.replace("/tty.", "/cu.")));
+            list.sort_by_key(|p| !p.name.contains("/cu."));
+        }
+    }
     if exact.is_empty() {
-        other.retain(|n| !n.contains("/tty.") || !cfg!(target_os = "macos"));
         exact = other;
     }
     exact
+}
+
+/// Names of the ports from `list_ports`.
+pub fn find_ports() -> Vec<String> {
+    list_ports().into_iter().map(|p| p.name).collect()
 }
 
 pub struct Device {
@@ -102,9 +140,18 @@ pub struct Stats {
 
 impl Device {
     pub fn open(port: Option<&str>) -> Result<Device> {
-        let candidates = match port {
-            Some(p) => vec![p.to_string()],
-            None => find_ports(),
+        Self::open_chosen(port, None)
+    }
+
+    /// Open the chosen device: the one with this USB serial number if it is connected
+    /// (its port name can change), else the port; with neither, the first one found.
+    pub fn open_chosen(port: Option<&str>, serial: Option<&str>) -> Result<Device> {
+        let by_serial =
+            serial.and_then(|s| list_ports().into_iter().find(|p| p.serial.as_deref() == Some(s))).map(|p| p.name);
+        let candidates = match (by_serial, port) {
+            (Some(p), _) => vec![p],
+            (None, Some(p)) => vec![p.to_string()],
+            (None, None) => find_ports(),
         };
         if candidates.is_empty() {
             bail!("no MSU2 device found");

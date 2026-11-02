@@ -22,6 +22,9 @@ fn file_name(p: &Option<PathBuf>) -> String {
     p.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "none".into())
 }
 
+/// (port, USB serial number) of a device in the device list; (None, None) = the first one found
+type DeviceChoice = (Option<String>, Option<String>);
+
 #[derive(Default)]
 struct FlashState {
     busy: bool,
@@ -43,6 +46,7 @@ pub fn run(port: Option<String>) -> Result<()> {
     let mut cfg = Config::load();
     if port.is_some() {
         cfg.port = port;
+        cfg.device_serial = None;
     }
 
     let result = wxdragon::main(move |_| {
@@ -66,9 +70,66 @@ fn build(cfg: Config, resume_background: bool) {
     let root = BoxSizer::builder(Orientation::Vertical).build();
     let pad = 8;
 
+    // -- device ---------------------------------------------------------------------
+    let dev_row = BoxSizer::builder(Orientation::Horizontal).build();
+    let dev_title = StaticText::builder(&panel).with_label("Device:").build();
+    let dev_choice = Choice::builder(&panel).build();
+    dev_choice.set_tooltip("Which USB screen to use when more than one is connected.");
+    let dev_search = Button::builder(&panel).with_label("Search again").build();
+    dev_search.set_tooltip("Look for screens that were plugged in after this window opened.");
+    // (port, USB serial number) of each entry; (None, None) = the first one found
+    let dev_entries: Rc<RefCell<Vec<DeviceChoice>>> = Rc::default();
+    let fill_devices = {
+        let (h, entries) = (handle.clone(), dev_entries.clone());
+        Rc::new(move || {
+            let (port, serial) = {
+                let c = h.borrow().cfg.lock().unwrap().clone();
+                (c.port, c.device_serial)
+            };
+            let mut list: Vec<(DeviceChoice, String)> =
+                vec![((None, None), "Automatic (the first one found)".to_string())];
+            for p in crate::device::list_ports() {
+                let text = if p.exact { p.describe() } else { format!("{}   (other USB device)", p.describe()) };
+                list.push(((Some(p.name), p.serial), text));
+            }
+            let chosen = |e: &DeviceChoice| match &serial {
+                Some(s) => e.1.as_ref() == Some(s),
+                None => e.0 == port,
+            };
+            if !list.iter().any(|(e, _)| chosen(e)) {
+                let name = port.clone().unwrap_or_default();
+                list.push((
+                    (port.clone(), serial.clone()),
+                    format!("{}   (not connected)", name.trim_start_matches("/dev/")),
+                ));
+            }
+            dev_choice.clear();
+            for (_, text) in &list {
+                dev_choice.append(text);
+            }
+            dev_choice.set_selection(list.iter().position(|(e, _)| chosen(e)).unwrap_or(0) as u32);
+            *entries.borrow_mut() = list.into_iter().map(|(e, _)| e).collect();
+        })
+    };
+    fill_devices();
+    {
+        let (h, entries) = (handle.clone(), dev_entries.clone());
+        dev_choice.on_selection_changed(move |e| {
+            let Some(i) = e.get_selection() else { return };
+            let Some((port, serial)) = entries.borrow().get(i as usize).cloned() else { return };
+            h.borrow().set_device(port, serial);
+        });
+        let fill = fill_devices.clone();
+        dev_search.on_click(move |_| fill());
+    }
+    dev_row.add(&dev_title, 0, SizerFlag::AlignCenterVertical | SizerFlag::Right, 4);
+    dev_row.add(&dev_choice, 1, SizerFlag::AlignCenterVertical, 0);
+    dev_row.add(&dev_search, 0, SizerFlag::AlignCenterVertical | SizerFlag::Left, 6);
+    root.add_sizer(&dev_row, 0, SizerFlag::Expand | SizerFlag::Left | SizerFlag::Right | SizerFlag::Top, pad);
+
     // -- status ---------------------------------------------------------------------
     let status_row = BoxSizer::builder(Orientation::Horizontal).build();
-    let status_title = StaticText::builder(&panel).with_label("Device:").build();
+    let status_title = StaticText::builder(&panel).with_label("Status:").build();
     let status = StaticText::builder(&panel).with_label("starting...").build();
     let rate = StaticText::builder(&panel).with_label("").build();
     status_row.add(&status_title, 0, SizerFlag::AlignCenterVertical | SizerFlag::Right, 4);

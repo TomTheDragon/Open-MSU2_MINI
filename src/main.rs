@@ -256,6 +256,7 @@ fn run(cli: Cli) -> Result<()> {
             let mut cfg = Config::load();
             if let Some(p) = cli.port {
                 cfg.port = Some(p);
+                cfg.device_serial = None;
             }
             if let Some(m) = mode {
                 cfg.mode = match m {
