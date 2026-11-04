@@ -51,6 +51,7 @@ fi
 MISSING=$(ldd "$BIN" 2>/dev/null | awk '/not found/ {print $1}' | tr '\n' ' ')
 [ -n "$MISSING" ] && echo "WARNING: missing libraries: $MISSING- install them as shown under \"Install\" in README.md"
 command -v ffmpeg >/dev/null || echo "NOTE: install ffmpeg to play videos (see \"Install\" in README.md)"
+command -v yt-dlp >/dev/null || echo "NOTE: install yt-dlp to play YouTube streams (see \"Install\" in README.md)"
 
 # serial port access: the udev rule, or the group that owns serial ports (dialout; uucp on Arch)
 if [ ! -f "$UDEV" ]; then

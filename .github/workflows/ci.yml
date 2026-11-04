@@ -43,6 +43,11 @@ jobs:
         run: choco install ninja -y
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
+      - name: Check the optional parts (without video and YouTube, without the window)
+        if: runner.os == 'Linux'
+        run: |
+          cargo check --release --target ${{ matrix.target }} --no-default-features --features gui
+          cargo check --release --target ${{ matrix.target }} --no-default-features --features youtube
       - name: Rename
         shell: bash
         run: cp target/${{ matrix.target }}/release/${{ matrix.file }} ${{ matrix.asset }}

@@ -6,16 +6,20 @@
 //!
 //! Every frame carries its time in the video; it is shown when the playback clock gets
 //! there, and skipped when the device falls behind. With sound, the sound card is the clock.
+//!
+//! Network streams (the YouTube mode) are always read by ffmpeg.
 
 use crate::audio::Sound;
 use crate::device::Frame565;
 use crate::render::{Screen, Size};
 use crate::scale::Scaling;
 use anyhow::{Context, Result};
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// File types offered in the file dialog.
@@ -30,6 +34,51 @@ pub const INSTALL_FFMPEG: &str = if cfg!(windows) {
 
 /// ffmpeg output rate (the panel shows about 25 full frames per second at most)
 const FFMPEG_FPS: u32 = 30;
+
+/// What a video (or its sound) is read from
+#[derive(Clone, Debug)]
+pub enum Input {
+    File(PathBuf),
+    /// Network address, with the HTTP headers it needs
+    Url {
+        url: String,
+        headers: Vec<(String, String)>,
+    },
+}
+
+impl Input {
+    /// Adds ffmpeg's input options and `-i <input>`.
+    pub(crate) fn add_to(&self, cmd: &mut Command) {
+        match self {
+            Input::File(p) => {
+                cmd.arg("-i").arg(p);
+            }
+            Input::Url { url, headers } => {
+                if url.starts_with("http") {
+                    // carry on through short network drops
+                    cmd.args(["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]);
+                    if !headers.is_empty() {
+                        cmd.arg("-headers")
+                            .arg(headers.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect::<String>());
+                    }
+                }
+                cmd.arg("-i").arg(url);
+            }
+        }
+    }
+
+    /// The file, for the built-in decoders (macOS)
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn file(&self) -> Option<&Path> {
+        match self {
+            Input::File(p) => Some(p),
+            Input::Url { .. } => None,
+        }
+    }
+}
+
+/// The running ffmpeg, so closing the screen ends it even while it waits for the network
+type Running = Arc<Mutex<Option<Child>>>;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Playback {
@@ -61,41 +110,71 @@ pub struct VideoScreen {
     /// The decoder stopped for good
     finished: bool,
     error: Option<Frame565>,
+    error_text: Option<String>,
     size: Size,
+    running: Running,
 }
 
 impl VideoScreen {
     /// Opens the video and starts decoding in the background. Errors (unreadable file,
     /// unsupported format without ffmpeg) are returned here.
     pub fn new(path: &Path, fit: Scaling, size: Size, playback: Playback) -> Result<Self> {
+        let input = Input::File(path.to_owned());
+        let sound = playback.sound.then(|| Sound::start(&input, Arc::new(AtomicBool::new(true))));
+        Self::open(&input, sound, fit, size, playback.looping)
+    }
+
+    /// Plays a network stream (once). `sound` is the soundtrack, heard while `sound_on` is set.
+    pub fn stream(
+        video: &Input,
+        sound: Option<&Input>,
+        sound_on: Arc<AtomicBool>,
+        fit: Scaling,
+        size: Size,
+    ) -> Result<Self> {
+        let sound = sound.map(|s| Sound::start(s, sound_on));
+        Self::open(video, sound, fit, size, false)
+    }
+
+    fn open(input: &Input, sound: Option<Sound>, fit: Scaling, size: Size, looping: bool) -> Result<Self> {
         let (tx, rx) = sync_channel::<Msg>(4);
-        let looping = playback.looping;
-        #[cfg(not(target_os = "macos"))]
-        {
-            let ffmpeg = find_ffmpeg().ok_or_else(|| anyhow::anyhow!("videos need ffmpeg; {INSTALL_FFMPEG}"))?;
-            start_ffmpeg_decoder(ffmpeg, path, fit, size, looping, tx)?;
-        }
+        let running = Running::default();
         #[cfg(target_os = "macos")]
-        match builtin::Mp4Source::open(path) {
-            Ok(src) => {
+        let builtin = match input.file() {
+            Some(path) => Some(builtin::Mp4Source::open(path)),
+            None => None,
+        };
+        #[cfg(not(target_os = "macos"))]
+        let builtin: Option<Result<()>> = None;
+        match builtin {
+            None => {
+                let what = if input.file().is_some() { "videos" } else { "streams" };
+                let ffmpeg = find_ffmpeg().ok_or_else(|| anyhow::anyhow!("{what} need ffmpeg; {INSTALL_FFMPEG}"))?;
+                start_ffmpeg_decoder(ffmpeg, input, fit, size, looping, tx, &running)?;
+            }
+            #[cfg(target_os = "macos")]
+            Some(Ok(src)) => {
                 std::thread::Builder::new()
                     .name("video".into())
                     .spawn(move || builtin::run(src, fit, size, looping, tx))
                     .context("cannot start the video thread")?;
             }
-            Err(builtin_err) => {
+            #[cfg(target_os = "macos")]
+            Some(Err(builtin_err)) => {
                 let Some(ffmpeg) = find_ffmpeg() else {
                     return Err(builtin_err.context(
                         "this video format needs ffmpeg; install ffmpeg (or put it next to this program), \
                          or use an MP4 file with H.264 video",
                     ));
                 };
-                start_ffmpeg_decoder(ffmpeg, path, fit, size, looping, tx)?;
+                start_ffmpeg_decoder(ffmpeg, input, fit, size, looping, tx, &running)?;
             }
+            #[cfg(not(target_os = "macos"))]
+            Some(_) => unreachable!(),
         }
         Ok(VideoScreen {
             rx,
-            sound: playback.sound.then(|| Sound::start(path)),
+            sound,
             looping,
             pass_start: None,
             pending: None,
@@ -104,8 +183,26 @@ impl VideoScreen {
             ended: false,
             finished: false,
             error: None,
+            error_text: None,
             size,
+            running,
         })
+    }
+
+    /// The first picture is there
+    pub fn started(&self) -> bool {
+        self.last.is_some()
+    }
+
+    /// Playback has stopped for good (end of the video or stream); the last picture stays
+    pub fn finished(&self) -> bool {
+        // without looping, the end of the pass is the end
+        self.pending.is_none() && (self.finished || (self.ended && !self.looping))
+    }
+
+    /// Why playback failed, if it did
+    pub fn error(&self) -> Option<&str> {
+        self.error_text.as_deref()
     }
 
     /// Playback position in the current pass; None before its first picture.
@@ -118,6 +215,7 @@ impl VideoScreen {
         eprintln!("video: {e}");
         let msg = crate::render::message(&["Cannot play", "the video"], [255, 120, 120], self.size);
         self.error = Some(msg.clone());
+        self.error_text = Some(e.to_string());
         self.sound = None;
         (msg, Duration::from_millis(500))
     }
@@ -192,6 +290,14 @@ impl Screen for VideoScreen {
         }
         let f = self.last.clone().unwrap_or_else(|| vec![0; self.size.0 * self.size.1]);
         (f, wait)
+    }
+}
+
+impl Drop for VideoScreen {
+    fn drop(&mut self) {
+        if let Some(c) = self.running.lock().unwrap().as_mut() {
+            let _ = c.kill(); // the video thread then ends and cleans up
+        }
     }
 }
 
@@ -336,33 +442,46 @@ mod builtin {
 
 fn start_ffmpeg_decoder(
     ffmpeg: PathBuf,
-    path: &Path,
+    input: &Input,
     fit: Scaling,
     size: Size,
     looping: bool,
     tx: SyncSender<Msg>,
+    running: &Running,
 ) -> Result<()> {
-    let path = path.to_owned();
-    let child = start_ffmpeg(&ffmpeg, &path, fit, size)?;
+    let input = input.clone();
+    let first = start_ffmpeg(&ffmpeg, &input, fit, size, running)?;
+    let running = running.clone();
     std::thread::Builder::new()
         .name("video".into())
-        .spawn(move || ffmpeg_loop(child, &ffmpeg, &path, fit, size, looping, tx))
+        .spawn(move || ffmpeg_loop(first, &ffmpeg, &input, fit, size, looping, tx, &running))
         .context("cannot start the video thread")?;
     Ok(())
 }
 
 pub(crate) fn find_ffmpeg() -> Option<PathBuf> {
-    let name = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
-    let beside = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join(name)));
-    // Windows: where "winget install Gyan.FFmpeg" links it (in PATH only for programs
+    find_tool("ffmpeg", &["-version"])
+}
+
+/// Finds a helper program: next to this program, where winget (Windows) or Homebrew (macOS)
+/// put it, or in PATH. `args` is a quick command that must succeed.
+pub(crate) fn find_tool(tool: &str, args: &[&str]) -> Option<PathBuf> {
+    let name = if cfg!(windows) { format!("{tool}.exe") } else { tool.to_string() };
+    let beside = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join(&name)));
+    // Windows: where "winget install ..." links it (in PATH only for programs
     // started after the installation)
     let winget = std::env::var_os("LOCALAPPDATA")
         .filter(|_| cfg!(windows))
-        .map(|d| PathBuf::from(d).join(r"Microsoft\WinGet\Links").join(name));
-    let candidates = beside.into_iter().chain(winget).filter(|p| p.is_file()).chain([PathBuf::from(name)]);
+        .map(|d| PathBuf::from(d).join(r"Microsoft\WinGet\Links").join(&name));
+    // macOS: programs started from the Finder do not get Homebrew's PATH
+    let brew = ["/opt/homebrew/bin", "/usr/local/bin"]
+        .iter()
+        .filter(|_| cfg!(target_os = "macos"))
+        .map(|d| Path::new(d).join(&name));
+    let candidates = beside.into_iter().chain(winget).chain(brew).filter(|p| p.is_file()).chain([PathBuf::from(&name)]);
     for c in candidates {
         let mut cmd = Command::new(&c);
-        cmd.arg("-version").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        cmd.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
         no_window(&mut cmd);
         if cmd.status().map(|s| s.success()).unwrap_or(false) {
             return Some(c);
@@ -381,8 +500,14 @@ pub(crate) fn no_window(cmd: &mut Command) {
     let _ = cmd;
 }
 
+/// One ffmpeg run: its pictures, and its last error message once it has ended
+struct FfmpegRun {
+    out: ChildStdout,
+    last_error: std::thread::JoinHandle<String>,
+}
+
 /// ffmpeg scales to the canvas size itself and makes a steady frame rate.
-fn start_ffmpeg(ffmpeg: &Path, path: &Path, fit: Scaling, size: Size) -> Result<Child> {
+fn start_ffmpeg(ffmpeg: &Path, input: &Input, fit: Scaling, size: Size, running: &Running) -> Result<FfmpegRun> {
     let (w, h) = size;
     let scale = match fit {
         Scaling::Crop => format!("scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}"),
@@ -392,35 +517,50 @@ fn start_ffmpeg(ffmpeg: &Path, path: &Path, fit: Scaling, size: Size) -> Result<
         Scaling::Stretch => format!("scale={w}:{h}"),
     };
     let mut cmd = Command::new(ffmpeg);
-    cmd.args(["-v", "error", "-nostdin", "-i"])
-        .arg(path)
-        .args(["-an", "-sn", "-dn", "-vf"])
+    cmd.args(["-v", "error", "-nostdin"]);
+    input.add_to(&mut cmd);
+    cmd.args(["-an", "-sn", "-dn", "-vf"])
         .arg(format!("{scale},setsar=1,fps={FFMPEG_FPS}"))
         .args(["-pix_fmt", "rgb24", "-f", "rawvideo", "-"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     no_window(&mut cmd);
-    cmd.spawn().context("cannot start ffmpeg")
+    let mut child = cmd.spawn().context("cannot start ffmpeg")?;
+    let out = child.stdout.take().expect("piped");
+    let err = child.stderr.take().expect("piped");
+    // read the messages as they come: a full pipe would stop ffmpeg (long streams)
+    let last_error = std::thread::spawn(move || {
+        let mut last = String::new();
+        for line in BufReader::new(err).lines().map_while(|l| l.ok()) {
+            if !line.trim().is_empty() {
+                last = line;
+            }
+        }
+        last
+    });
+    *running.lock().unwrap() = Some(child);
+    Ok(FfmpegRun { out, last_error })
 }
 
-/// One ffmpeg run per pass; `child` is the first one (started early to report errors).
+/// One ffmpeg run per pass; `run` is the first one (started early to report errors).
+#[allow(clippy::too_many_arguments)]
 fn ffmpeg_loop(
-    mut child: Child,
+    mut run: FfmpegRun,
     ffmpeg: &Path,
-    path: &Path,
+    input: &Input,
     fit: Scaling,
     size: Size,
     looping: bool,
     tx: SyncSender<Msg>,
+    running: &Running,
 ) {
     let frame_time = Duration::from_secs_f64(1.0 / FFMPEG_FPS as f64);
     let mut buf = vec![0u8; size.0 * size.1 * 3];
     loop {
-        let mut out = child.stdout.take().expect("piped");
         let mut frames = 0u32;
         let mut closed = false;
-        while out.read_exact(&mut buf).is_ok() {
+        while run.out.read_exact(&mut buf).is_ok() {
             let frame: Frame565 =
                 buf.as_chunks::<3>().0.iter().map(|[r, g, b]| crate::device::rgb565(*r, *g, *b)).collect();
             if tx.send(Msg::Frame(frame, frame_time * frames, frame_time)).is_err() {
@@ -429,25 +569,25 @@ fn ffmpeg_loop(
             }
             frames += 1;
         }
-        let _ = child.kill();
-        let mut err = String::new();
-        if let Some(mut e) = child.stderr.take() {
-            let _ = e.read_to_string(&mut err);
+        if let Some(mut child) = running.lock().unwrap().take() {
+            let _ = child.kill();
+            let _ = child.wait();
         }
-        let _ = child.wait();
+        drop(run.out);
+        let err = run.last_error.join().unwrap_or_default();
         if closed {
             return;
         }
         if frames == 0 {
-            let msg = err.lines().last().unwrap_or("ffmpeg could not read the video").to_string();
+            let msg = if err.is_empty() { "ffmpeg could not read the video".to_string() } else { err };
             let _ = tx.send(Msg::Error(msg));
             return;
         }
         if tx.send(Msg::End).is_err() || !looping {
             return;
         }
-        child = match start_ffmpeg(ffmpeg, path, fit, size) {
-            Ok(c) => c,
+        run = match start_ffmpeg(ffmpeg, input, fit, size, running) {
+            Ok(r) => r,
             Err(e) => {
                 let _ = tx.send(Msg::Error(format!("{e:#}")));
                 return;

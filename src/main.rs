@@ -3,6 +3,7 @@
 // Some helpers are only used by the window; keep the window-less build warning-free.
 #![cfg_attr(not(feature = "gui"), allow(dead_code))]
 
+#[cfg(feature = "video")]
 mod audio;
 mod capture;
 mod config;
@@ -15,11 +16,16 @@ mod gui;
 mod gui_stats;
 #[cfg(feature = "gui")]
 mod gui_tray;
+#[cfg(all(feature = "gui", feature = "youtube"))]
+mod gui_youtube;
 mod probe;
 mod render;
 mod scale;
 mod stats;
+#[cfg(feature = "video")]
 mod video;
+#[cfg(feature = "youtube")]
+mod youtube;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -56,7 +62,12 @@ enum ModeArg {
     Clock,
     Image,
     Gif,
+    #[cfg(feature = "video")]
     Video,
+    /// A YouTube live stream or video (--youtube)
+    #[cfg(feature = "youtube")]
+    #[value(name = "youtube")]
+    YouTube,
     /// Slot1 on the device (image)
     #[value(name = "slot1", alias = "device-image", alias = "album")]
     DeviceImage,
@@ -126,14 +137,21 @@ enum Cmd {
         #[arg(long, value_parser = clap::value_parser!(u8).range(10..=100))]
         brightness: Option<u8>,
         /// Video for the video mode
+        #[cfg(feature = "video")]
         #[arg(long)]
         video: Option<PathBuf>,
-        /// Play the video's sound (--sound=false to turn it off)
+        /// Play the sound of the video or YouTube stream (--sound=false to turn it off)
+        #[cfg(feature = "video")]
         #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         sound: Option<bool>,
         /// Start the video again at the end (--loop=false: play once, keep the last picture)
+        #[cfg(feature = "video")]
         #[arg(long = "loop", num_args = 0..=1, default_missing_value = "true")]
         looping: Option<bool>,
+        /// YouTube live stream or video for the YouTube mode: an address or the name of a favourite
+        #[cfg(feature = "youtube")]
+        #[arg(long, value_name = "URL")]
+        youtube: Option<String>,
         #[arg(long)]
         clock_background: Option<PathBuf>,
         /// Ignore the push button on the device
@@ -246,9 +264,14 @@ fn run(cli: Cli) -> Result<()> {
             image,
             gif,
             brightness,
+            #[cfg(feature = "video")]
             video,
+            #[cfg(feature = "video")]
             sound,
+            #[cfg(feature = "video")]
             looping,
+            #[cfg(feature = "youtube")]
+            youtube,
             clock_background,
             no_button,
             save,
@@ -265,7 +288,10 @@ fn run(cli: Cli) -> Result<()> {
                     ModeArg::Clock => Mode::Clock,
                     ModeArg::Image => Mode::Image,
                     ModeArg::Gif => Mode::Gif,
+                    #[cfg(feature = "video")]
                     ModeArg::Video => Mode::Video,
+                    #[cfg(feature = "youtube")]
+                    ModeArg::YouTube => Mode::YouTube,
                     ModeArg::DeviceImage => Mode::Album,
                     ModeArg::DeviceGif => Mode::Animation,
                 };
@@ -300,15 +326,34 @@ fn run(cli: Cli) -> Result<()> {
             if let Some(b) = brightness {
                 cfg.brightness = b;
             }
+            #[cfg(feature = "video")]
             if let Some(v) = video {
                 cfg.video = Some(std::fs::canonicalize(&v).unwrap_or(v));
                 if mode.is_none() {
                     cfg.mode = Mode::Video;
                 }
             }
-            if let Some(s) = sound {
-                cfg.video_sound = s;
+            #[cfg(feature = "youtube")]
+            if let Some(y) = youtube {
+                cfg.youtube_url = Some(youtube::favorite_url(&cfg.youtube_favorites, &y));
+                cfg.youtube_playing = true;
+                if mode.is_none() {
+                    cfg.mode = Mode::YouTube;
+                }
             }
+            #[cfg(feature = "youtube")]
+            if matches!(mode, Some(ModeArg::YouTube)) {
+                cfg.youtube_playing = true;
+            }
+            #[cfg(feature = "video")]
+            if let Some(s) = sound {
+                if cfg.mode == Mode::YouTube {
+                    cfg.youtube_sound = s;
+                } else {
+                    cfg.video_sound = s;
+                }
+            }
+            #[cfg(feature = "video")]
             if let Some(l) = looping {
                 cfg.video_loop = l;
             }

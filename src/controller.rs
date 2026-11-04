@@ -6,7 +6,10 @@ use crate::device::{canvas_size, hw_flip, orient};
 use crate::device::{Device, Frame565, FLASH_ANIMATION, FLASH_IMAGE, FRAME_PAGES};
 use crate::render::{self, ClockScreen, ImageScreen, Screen};
 use crate::stats::StatsScreen;
+#[cfg(feature = "video")]
 use crate::video::{Playback, VideoScreen};
+#[cfg(feature = "youtube")]
+use crate::youtube::YouTubeScreen;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -24,6 +27,8 @@ pub struct Status {
     /// USB data rate in KB/s
     pub kbps: f32,
     pub mode: Mode,
+    /// Title of what is playing (YouTube)
+    pub title: Option<String>,
 }
 
 pub struct Handle {
@@ -32,6 +37,10 @@ pub struct Handle {
     changed: Arc<AtomicBool>,
     reselect: Arc<AtomicBool>,
     reconnect: Arc<AtomicBool>,
+    #[cfg_attr(not(feature = "youtube"), allow(dead_code))]
+    youtube_restart: Arc<AtomicBool>,
+    #[cfg_attr(not(feature = "youtube"), allow(dead_code))]
+    youtube_sound: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     jobs: mpsc::Sender<(Job, JobDone)>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -56,6 +65,24 @@ impl Handle {
             c.port = port;
             c.device_serial = serial;
         });
+    }
+    #[cfg(feature = "youtube")]
+    /// YouTube: play this address (again, also when it is the one playing).
+    pub fn play_youtube(&self, url: String) {
+        self.youtube_restart.store(true, Ordering::SeqCst);
+        self.update(|c| {
+            c.youtube_url = Some(url);
+            c.youtube_playing = true;
+            c.mode = Mode::YouTube;
+        });
+    }
+    #[cfg(feature = "youtube")]
+    /// YouTube: sound on or off, without interrupting the stream.
+    pub fn set_youtube_sound(&self, on: bool) {
+        let mut c = self.cfg.lock().unwrap();
+        c.youtube_sound = on;
+        c.save();
+        self.youtube_sound.store(on, Ordering::SeqCst);
     }
     pub fn run_job(&self, job: Job, done: JobDone) {
         let _ = self.jobs.send((job, done));
@@ -83,6 +110,8 @@ pub fn spawn(cfg: Config, use_button: bool, on_status: impl Fn(&Status) + Send +
     let changed = Arc::new(AtomicBool::new(true));
     let reselect = Arc::new(AtomicBool::new(false));
     let reconnect = Arc::new(AtomicBool::new(false));
+    let youtube_restart = Arc::new(AtomicBool::new(false));
+    let youtube_sound = Arc::new(AtomicBool::new(cfg.lock().unwrap().youtube_sound));
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
     let mut c = Controller {
@@ -91,6 +120,9 @@ pub fn spawn(cfg: Config, use_button: bool, on_status: impl Fn(&Status) + Send +
         changed: changed.clone(),
         reselect: reselect.clone(),
         reconnect: reconnect.clone(),
+        youtube_restart: youtube_restart.clone(),
+        youtube_sound: youtube_sound.clone(),
+        youtube_key: None,
         stop: stop.clone(),
         jobs: rx,
         on_status: Box::new(on_status),
@@ -111,7 +143,18 @@ pub fn spawn(cfg: Config, use_button: bool, on_status: impl Fn(&Status) + Send +
         dimmer: None,
     };
     let thread = std::thread::Builder::new().name("controller".into()).spawn(move || c.run()).unwrap();
-    Handle { cfg, status, changed, reselect, reconnect, stop, jobs: tx, thread: Some(thread) }
+    Handle {
+        cfg,
+        status,
+        changed,
+        reselect,
+        reconnect,
+        youtube_restart,
+        youtube_sound,
+        stop,
+        jobs: tx,
+        thread: Some(thread),
+    }
 }
 
 #[derive(Default)]
@@ -127,6 +170,10 @@ struct Controller {
     changed: Arc<AtomicBool>,
     reselect: Arc<AtomicBool>,
     reconnect: Arc<AtomicBool>,
+    youtube_restart: Arc<AtomicBool>,
+    youtube_sound: Arc<AtomicBool>,
+    /// What the YouTube screen plays; it keeps playing while this stays the same
+    youtube_key: Option<YouTubeKey>,
     stop: Arc<AtomicBool>,
     jobs: mpsc::Receiver<(Job, JobDone)>,
     on_status: Box<dyn Fn(&Status) + Send>,
@@ -178,6 +225,9 @@ impl Dimmer {
     }
 }
 
+/// YouTube address, playing, scaling, canvas size
+type YouTubeKey = (Option<String>, bool, crate::scale::Scaling, crate::render::Size);
+
 /// The mode after the current one in the button's cycle: all modes (or the configured
 /// list), without Image, GIF and Video while no file is chosen for them.
 fn next_button_mode(cfg: &Config) -> Mode {
@@ -186,13 +236,20 @@ fn next_button_mode(cfg: &Config) -> Mode {
         Mode::Image => cfg.image.is_some(),
         Mode::Gif => cfg.gif.is_some(),
         Mode::Video => cfg.video.is_some(),
+        Mode::YouTube => cfg.youtube_url.is_some(),
         _ => true,
     };
+    let usable = |m: &Mode| m.available() && usable(m);
     let start = seq.iter().position(|m| *m == cfg.mode).map_or(0, |i| i + 1);
     (0..seq.len()).map(|k| seq[(start + k) % seq.len()]).find(usable).unwrap_or(cfg.mode)
 }
 
 const BUTTON_POLL: Duration = Duration::from_millis(200);
+
+/// YouTube starts this long after its mode is chosen (so the device's button can pass it
+/// without starting a stream each time)
+#[cfg_attr(not(feature = "youtube"), allow(dead_code))]
+const YOUTUBE_AUTOPLAY_DELAY: Duration = Duration::from_secs(2);
 
 impl Controller {
     fn set_status(&self, f: impl FnOnce(&mut Status)) {
@@ -204,7 +261,9 @@ impl Controller {
     fn run(&mut self) {
         while !self.stop.load(Ordering::SeqCst) {
             if let Err(e) = self.tick() {
-                self.dev = None;
+                if self.dev.take().is_some() {
+                    self.device_lost();
+                }
                 self.shown = None;
                 let msg = format!("waiting for device ({e:#})");
                 self.set_status(|s| {
@@ -223,6 +282,21 @@ impl Controller {
         self.capture = None;
         if let Some(d) = self.dev.as_mut() {
             let _ = d.flush();
+        }
+    }
+
+    /// The device is gone: stop what plays (a video's or stream's sound would go on), and
+    /// stop YouTube for good (Play starts it again). Other modes start again when the
+    /// device is back.
+    fn device_lost(&mut self) {
+        self.screen = None;
+        self.youtube_key = None;
+        if self.mode == Mode::YouTube {
+            let mut c = self.cfg.lock().unwrap();
+            if c.youtube_playing {
+                c.youtube_playing = false;
+                c.save();
+            }
         }
     }
 
@@ -287,7 +361,7 @@ impl Controller {
     }
 
     fn enter_mode(&mut self) -> anyhow::Result<()> {
-        let cfg = self.cfg.lock().unwrap().clone();
+        let mut cfg = self.cfg.lock().unwrap().clone();
         let flip = hw_flip(cfg.rotation);
         if self.rotation != cfg.rotation {
             self.shown = None;
@@ -303,12 +377,34 @@ impl Controller {
             self.dimmer = (cfg.brightness < 100).then(|| Dimmer::new(cfg.brightness));
             self.shown = None;
         }
+        // YouTube chosen (coming from another mode): it plays by itself after a moment, also
+        // when it was stopped
+        let youtube_selected = cfg.mode == Mode::YouTube && self.mode != Mode::YouTube;
+        if youtube_selected && !cfg.youtube_playing && cfg.youtube_url.is_some() {
+            cfg.youtube_playing = true;
+            let mut c = self.cfg.lock().unwrap();
+            c.youtube_playing = true;
+            c.save();
+        }
         self.mode = cfg.mode;
-        self.screen = None;
+        #[cfg_attr(not(feature = "youtube"), allow(unused_variables))]
+        let old_screen = self.screen.take();
         self.meter = Meter::default();
+        self.youtube_sound.store(cfg.youtube_sound, Ordering::SeqCst);
+        let youtube_key: YouTubeKey = (cfg.youtube_url.clone(), cfg.youtube_playing, cfg.fit, size);
+        let restart = self.youtube_restart.swap(false, Ordering::SeqCst);
+        let keep_youtube = self.mode == Mode::YouTube && self.youtube_key.as_ref() == Some(&youtube_key) && !restart;
+        // Play (or a favourite) starts right away
+        #[cfg_attr(not(feature = "youtube"), allow(unused_variables))]
+        let youtube_delay = if youtube_selected && !restart { YOUTUBE_AUTOPLAY_DELAY } else { Duration::ZERO };
+        self.youtube_key = None;
         let mode = cfg.mode;
+        let keep_title = keep_youtube;
         self.set_status(|s| {
             s.mode = mode;
+            if !keep_title {
+                s.title = None;
+            }
             s.fps = 0.0;
             s.kbps = 0.0;
         });
@@ -329,6 +425,7 @@ impl Controller {
                     None => self.show(render::message(&[&format!("No {what} selected")], [255, 255, 255], size))?,
                 }
             }
+            #[cfg(feature = "video")]
             Mode::Video => match cfg.video.as_deref().map(|p| {
                 VideoScreen::new(p, cfg.fit, size, Playback { sound: cfg.video_sound, looping: cfg.video_loop })
             }) {
@@ -339,6 +436,27 @@ impl Controller {
                 }
                 None => self.show(render::message(&["No video selected"], [255, 255, 255], size))?,
             },
+            #[cfg(feature = "youtube")]
+            Mode::YouTube => {
+                self.screen = match old_screen {
+                    Some(s) if keep_youtube => Some(s),
+                    _ => Some(Box::new(YouTubeScreen::new(
+                        cfg.youtube_url.as_deref(),
+                        cfg.youtube_playing,
+                        youtube_delay,
+                        cfg.fit,
+                        size,
+                        self.youtube_sound.clone(),
+                    ))),
+                };
+                self.youtube_key = Some(youtube_key);
+            }
+            // modes left out of this build
+            #[allow(unreachable_patterns)]
+            Mode::Video | Mode::YouTube => {
+                self.set_status(|s| s.text = format!("{} is not part of this build", mode.label()));
+                self.show(render::message(&["Not available", "in this build"], [255, 120, 120], size))?;
+            }
             Mode::Album => {
                 self.dev.as_mut().unwrap().show_flash_image(FLASH_IMAGE)?;
                 self.shown = None;
@@ -449,6 +567,12 @@ impl Controller {
             _ => match self.screen.as_mut() {
                 Some(s) => {
                     let (f, d) = s.render();
+                    if let Some(st) = s.status() {
+                        self.set_status(|s| {
+                            s.text = st.text;
+                            s.title = st.title;
+                        });
+                    }
                     self.show(f)?;
                     Ok(d)
                 }
@@ -492,6 +616,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(feature = "youtube")]
     fn button_cycles_all_modes_with_a_file() {
         let mut cfg = Config { mode: Mode::Clock, ..Default::default() };
         // no files: Image, GIF and Video are skipped
@@ -501,6 +626,10 @@ mod tests {
         assert_eq!(next_button_mode(&cfg), Mode::Image);
         cfg.mode = Mode::Image;
         assert_eq!(next_button_mode(&cfg), Mode::Video);
+        cfg.mode = Mode::Video;
+        assert_eq!(next_button_mode(&cfg), Mode::Album);
+        cfg.youtube_url = Some("https://www.youtube.com/@LofiGirl/live".into());
+        assert_eq!(next_button_mode(&cfg), Mode::YouTube);
         cfg.mode = Mode::Animation;
         assert_eq!(next_button_mode(&cfg), Mode::Mirror);
     }

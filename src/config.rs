@@ -13,6 +13,9 @@ pub enum Mode {
     Image,
     Gif,
     Video,
+    /// A YouTube live stream or video
+    #[serde(rename = "youtube")]
+    YouTube,
     /// The still picture stored on the device
     Album,
     /// The 36-frame animation stored on the device
@@ -20,8 +23,23 @@ pub enum Mode {
 }
 
 impl Mode {
-    pub const ALL: [Mode; 8] =
-        [Mode::Mirror, Mode::Stats, Mode::Clock, Mode::Image, Mode::Gif, Mode::Video, Mode::Album, Mode::Animation];
+    /// The modes this build offers (Video and YouTube are optional features)
+    pub const ALL: &'static [Mode] = &[
+        Mode::Mirror,
+        Mode::Stats,
+        Mode::Clock,
+        Mode::Image,
+        Mode::Gif,
+        #[cfg(feature = "video")]
+        Mode::Video,
+        #[cfg(feature = "youtube")]
+        Mode::YouTube,
+        Mode::Album,
+        Mode::Animation,
+    ];
+    pub fn available(self) -> bool {
+        Mode::ALL.contains(&self)
+    }
     pub fn label(self) -> &'static str {
         match self {
             Mode::Mirror => "Screen mirror",
@@ -30,6 +48,7 @@ impl Mode {
             Mode::Image => "Image",
             Mode::Gif => "GIF",
             Mode::Video => "Video",
+            Mode::YouTube => "YouTube",
             Mode::Album => "Slot1 on device (image)",
             Mode::Animation => "Slot2 on device (image or GIF)",
         }
@@ -66,6 +85,14 @@ pub struct Config {
     /// Start the video again at the end (otherwise its last picture stays)
     pub video_loop: bool,
     pub clock_background: Option<PathBuf>,
+    /// YouTube mode: address of the live stream or video
+    pub youtube_url: Option<String>,
+    /// YouTube mode: playing (false = stopped)
+    pub youtube_playing: bool,
+    /// YouTube mode: play the sound
+    pub youtube_sound: bool,
+    /// YouTube mode: saved streams and videos
+    pub youtube_favorites: Vec<Favorite>,
     /// Serial port of the chosen device; None = the first one found
     pub port: Option<String>,
     /// USB serial number of the chosen device, if it has one (the port name can change)
@@ -96,6 +123,10 @@ impl Default for Config {
             video_sound: false,
             video_loop: true,
             clock_background: None,
+            youtube_url: None,
+            youtube_playing: true,
+            youtube_sound: false,
+            youtube_favorites: Vec::new(),
             port: None,
             device_serial: None,
             stats: StatsConfig::default(),
@@ -103,6 +134,13 @@ impl Default for Config {
             start_minimized: false,
         }
     }
+}
+
+/// A saved YouTube address
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Favorite {
+    pub name: String,
+    pub url: String,
 }
 
 /// Lowest brightness setting (percent), so the screen never goes completely dark
@@ -516,6 +554,10 @@ impl Config {
         c.max_fps = c.max_fps.clamp(0.1, 1000.0);
         c.stats.migrate();
         c.brightness = c.brightness.clamp(MIN_BRIGHTNESS, 100);
+        // a mode this build does not have (settings from a build with more features)
+        if !c.mode.available() {
+            c.mode = Mode::default();
+        }
         // the old default list left out Image and Video: use all modes instead
         if c.button_modes == [Mode::Mirror, Mode::Stats, Mode::Clock, Mode::Album, Mode::Animation] {
             c.button_modes.clear();

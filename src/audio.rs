@@ -4,7 +4,9 @@
 //! Linux / Windows: the soundtrack is decoded by ffmpeg.
 //! macOS: decoded inside the program (Symphonia: AAC, MP3, FLAC, Vorbis, PCM in
 //! MP4/MOV, MKV/WebM, OGG, WAV); other formats are handed to ffmpeg, if it is installed.
+//! Network streams are always decoded by ffmpeg.
 
+use crate::video::Input;
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
@@ -27,6 +29,10 @@ pub struct Sound {
 struct Shared {
     state: Mutex<State>,
     stop: AtomicBool,
+    /// Heard (otherwise silent; the clock keeps running)
+    on: Arc<AtomicBool>,
+    /// The running ffmpeg, ended when the sound is closed
+    ffmpeg: Mutex<Option<Child>>,
 }
 
 #[derive(Default)]
@@ -54,13 +60,15 @@ struct State {
 }
 
 impl Sound {
-    /// Starts decoding in the background. The sound stays silent until `play`.
-    pub fn start(path: &Path) -> Sound {
-        let shared = Arc::new(Shared::default());
+    /// Starts decoding in the background. The sound stays silent until `play`, and
+    /// while `on` is not set.
+    pub fn start(input: &Input, on: Arc<AtomicBool>) -> Sound {
+        let shared =
+            Arc::new(Shared { state: Mutex::default(), stop: AtomicBool::new(false), on, ffmpeg: Mutex::default() });
         let s = shared.clone();
-        let path = path.to_owned();
+        let input = input.clone();
         let spawned = std::thread::Builder::new().name("sound".into()).spawn(move || {
-            if let Err(e) = run(&s, &path) {
+            if let Err(e) = run(&s, &input) {
                 eprintln!("sound: {e:#}");
             }
             s.state.lock().unwrap().failed = true;
@@ -112,25 +120,28 @@ impl Sound {
 impl Drop for Sound {
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::SeqCst);
+        if let Some(c) = self.shared.ffmpeg.lock().unwrap().as_mut() {
+            let _ = c.kill(); // also when it waits for the network
+        }
     }
 }
 
 /// Sound thread: owns the output stream (not movable between threads on every system)
 /// and decodes one pass per `restart`.
-fn run(shared: &Arc<Shared>, path: &Path) -> Result<()> {
+fn run(shared: &Arc<Shared>, input: &Input) -> Result<()> {
     let (_stream, rate) = open_output(shared)?;
     let mut backend = None;
     loop {
         let generation = shared.state.lock().unwrap().generation;
         let mut source = match backend {
             None => {
-                let (s, b) = open_source(path, rate)?;
+                let (s, b) = open_source(shared, input, rate)?;
                 backend = Some(b);
                 s
             }
             #[cfg(target_os = "macos")]
-            Some(Backend::Builtin) => Source::Builtin(Box::new(Builtin::open(path)?)),
-            Some(Backend::Ffmpeg(ref ff)) => Source::Ffmpeg(Ffmpeg::start(ff, path, rate)?),
+            Some(Backend::Builtin) => Source::Builtin(Box::new(Builtin::open(input.file().unwrap())?)),
+            Some(Backend::Ffmpeg(ref ff)) => Source::Ffmpeg(Ffmpeg::start(shared, ff, input, rate)?),
         };
         let mut resample = Resampler::new(rate);
         let mut buf = Vec::new();
@@ -223,13 +234,14 @@ fn build<T: SizedSample + FromSample<f32>>(
     let s = shared.clone();
     let data = move |data: &mut [T], info: &cpal::OutputCallbackInfo| {
         let ts = info.timestamp();
+        let volume = if s.on.load(Ordering::Relaxed) { 1.0 } else { 0.0 };
         let mut st = s.state.lock().unwrap();
         st.latency = ts.playback.duration_since(ts.callback).min(Duration::from_millis(500));
         let mut taken = 0u64;
         for frame in data.chunks_mut(channels) {
             let (l, r) = if st.playing && st.queue.len() >= 2 {
                 taken += 1;
-                (st.queue.pop_front().unwrap(), st.queue.pop_front().unwrap())
+                (st.queue.pop_front().unwrap() * volume, st.queue.pop_front().unwrap() * volume)
             } else {
                 (0.0, 0.0)
             };
@@ -326,16 +338,21 @@ impl Source {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-fn open_source(path: &Path, rate: u32) -> Result<(Source, Backend)> {
+fn open_ffmpeg(shared: &Arc<Shared>, input: &Input, rate: u32) -> Result<(Source, Backend)> {
     let ffmpeg =
         crate::video::find_ffmpeg().ok_or_else(|| anyhow!("sound needs ffmpeg; {}", crate::video::INSTALL_FFMPEG))?;
-    let f = Ffmpeg::start(&ffmpeg, path, rate)?;
+    let f = Ffmpeg::start(shared, &ffmpeg, input, rate)?;
     Ok((Source::Ffmpeg(f), Backend::Ffmpeg(ffmpeg)))
 }
 
+#[cfg(not(target_os = "macos"))]
+fn open_source(shared: &Arc<Shared>, input: &Input, rate: u32) -> Result<(Source, Backend)> {
+    open_ffmpeg(shared, input, rate)
+}
+
 #[cfg(target_os = "macos")]
-fn open_source(path: &Path, rate: u32) -> Result<(Source, Backend)> {
+fn open_source(shared: &Arc<Shared>, input: &Input, rate: u32) -> Result<(Source, Backend)> {
+    let Some(path) = input.file() else { return open_ffmpeg(shared, input, rate) };
     match Builtin::open(path) {
         Ok(b) => Ok((Source::Builtin(Box::new(b)), Backend::Builtin)),
         Err(e) if e.is::<NoSoundtrack>() => Err(e),
@@ -343,7 +360,7 @@ fn open_source(path: &Path, rate: u32) -> Result<(Source, Backend)> {
             let ffmpeg = crate::video::find_ffmpeg().ok_or_else(|| {
                 builtin_err.context("this sound format needs ffmpeg; install ffmpeg (or put it next to this program)")
             })?;
-            let f = Ffmpeg::start(&ffmpeg, path, rate)?;
+            let f = Ffmpeg::start(shared, &ffmpeg, input, rate)?;
             Ok((Source::Ffmpeg(f), Backend::Ffmpeg(ffmpeg)))
         }
     }
@@ -421,7 +438,7 @@ impl Builtin {
 }
 
 struct Ffmpeg {
-    child: Child,
+    shared: Arc<Shared>,
     out: ChildStdout,
     rate: u32,
     bytes: Vec<u8>,
@@ -429,11 +446,11 @@ struct Ffmpeg {
 
 impl Ffmpeg {
     /// ffmpeg converts to stereo at the device rate.
-    fn start(ffmpeg: &Path, path: &Path, rate: u32) -> Result<Self> {
+    fn start(shared: &Arc<Shared>, ffmpeg: &Path, input: &Input, rate: u32) -> Result<Self> {
         let mut cmd = Command::new(ffmpeg);
-        cmd.args(["-v", "error", "-nostdin", "-i"])
-            .arg(path)
-            .args(["-vn", "-sn", "-dn", "-ac", "2", "-ar"])
+        cmd.args(["-v", "error", "-nostdin"]);
+        input.add_to(&mut cmd);
+        cmd.args(["-vn", "-sn", "-dn", "-ac", "2", "-ar"])
             .arg(rate.to_string())
             .args(["-f", "f32le", "-"])
             .stdin(Stdio::null())
@@ -442,7 +459,8 @@ impl Ffmpeg {
         crate::video::no_window(&mut cmd);
         let mut child = cmd.spawn().context("cannot start ffmpeg")?;
         let out = child.stdout.take().expect("piped");
-        Ok(Ffmpeg { child, out, rate, bytes: vec![0; 4096 * 8] })
+        *shared.ffmpeg.lock().unwrap() = Some(child);
+        Ok(Ffmpeg { shared: shared.clone(), out, rate, bytes: vec![0; 4096 * 8] })
     }
 
     fn next_chunk(&mut self, buf: &mut Vec<f32>) -> Result<Option<(u32, usize)>> {
@@ -467,7 +485,9 @@ impl Ffmpeg {
 
 impl Drop for Ffmpeg {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(mut child) = self.shared.ffmpeg.lock().unwrap().take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }

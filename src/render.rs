@@ -121,6 +121,16 @@ pub fn blank(size: Size) -> RgbImage {
 pub trait Screen: Send {
     /// Render the next canvas; returns it and how long to wait before the next one.
     fn render(&mut self) -> (Frame565, Duration);
+    /// New text for the status line, when the screen has something to report
+    fn status(&mut self) -> Option<ScreenStatus> {
+        None
+    }
+}
+
+pub struct ScreenStatus {
+    pub text: String,
+    /// Title of what is playing (YouTube)
+    pub title: Option<String>,
 }
 
 // ---------------------------------------------------------------------------------

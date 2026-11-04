@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use wxdragon::prelude::*;
+use wxdragon::widgets::SimpleBook;
 
 const IMAGE_WILDCARD: &str =
     "Pictures (*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp)|*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp|All files|*";
@@ -140,7 +141,10 @@ fn build(cfg: Config, resume_background: bool) {
     // -- modes ----------------------------------------------------------------------
     let mode_box = StaticBoxSizerBuilder::new_with_label(Orientation::Vertical, &panel, "Show on the screen").build();
     let mode_parent = mode_box.get_static_box().unwrap();
-    let mode_grid = GridSizer::builder(4, 2).with_vgap(4).with_hgap(16).build();
+    let mode_grid = GridSizer::builder(Mode::ALL.len().div_ceil(2) as i32, 2).with_vgap(4).with_hgap(16).build();
+    // settings of the chosen mode: one page per mode, in the order of Mode::ALL
+    let book = SimpleBook::builder(&panel).build();
+    let page_of = |m: Mode| Mode::ALL.iter().position(|x| *x == m).unwrap_or(0);
     let mut radios = Vec::new();
     for (i, m) in Mode::ALL.iter().enumerate() {
         let mut b = RadioButton::builder(&mode_parent).with_label(m.label());
@@ -150,20 +154,330 @@ fn build(cfg: Config, resume_background: bool) {
         let rb = b.build();
         rb.set_value(*m == cfg.mode);
         let (h, m) = (handle.clone(), *m);
-        rb.on_selected(move |_| h.borrow().update(|c| c.mode = m));
+        rb.on_selected(move |_| {
+            book.set_selection(page_of(m));
+            h.borrow().update(|c| c.mode = m);
+        });
         mode_grid.add(&rb, 0, SizerFlag::AlignLeft, 0);
         radios.push((m, rb));
     }
     mode_box.add_sizer(&mode_grid, 0, SizerFlag::Expand | SizerFlag::All, 6);
     root.add_sizer(&mode_box, 0, SizerFlag::Expand | SizerFlag::Left | SizerFlag::Right, pad);
 
-    // -- options --------------------------------------------------------------------
-    let opt_box = StaticBoxSizerBuilder::new_with_label(Orientation::Vertical, &panel, "Options").build();
+    let cv = SizerFlag::AlignCenterVertical;
+    let label = |parent: &StaticBox, t: &str| StaticText::builder(parent).with_label(t).build();
+    let grey = |t: StaticText| {
+        t.set_foreground_color(Colour::new(128, 128, 128, 255));
+        t
+    };
+    // a page: a box titled like the mode, with a grid of label / control / button
+    let new_page = |m: Mode| {
+        let p = Panel::builder(&book).build();
+        let sb = StaticBoxSizerBuilder::new_with_label(Orientation::Vertical, &p, m.label()).build();
+        let bx = sb.get_static_box().unwrap();
+        let grid = FlexGridSizer::builder(0, 3).with_vgap(6).with_hgap(8).build();
+        grid.add_growable_col(1, 1);
+        (p, sb, bx, grid)
+    };
+    let finish_page = |p: Panel, sb: StaticBoxSizer, grid: Option<FlexGridSizer>| {
+        if let Some(grid) = grid {
+            sb.add_sizer(&grid, 0, SizerFlag::Expand | SizerFlag::All, 6);
+        }
+        let s = BoxSizer::builder(Orientation::Vertical).build();
+        s.add_sizer(&sb, 1, SizerFlag::Expand, 0);
+        p.set_sizer(s, true);
+        p
+    };
+    let mut pages: Vec<(Mode, Panel)> = Vec::new();
+
+    // screen mirror
+    {
+        let (p, sb, bx, grid) = new_page(Mode::Mirror);
+        // frame-rate limit, each choice marked with how well the device can reach it
+        let fps = Choice::builder(&bx).with_choices(FPS_CHOICES.iter().map(|f| fps_label(*f)).collect()).build();
+        let fps_index = FPS_CHOICES.iter().position(|f| *f >= cfg.max_fps - 0.001).unwrap_or(FPS_CHOICES.len() - 1);
+        fps.set_selection(fps_index as u32);
+        fps.set_tooltip(
+            "✓ full screen: reached even when the whole picture changes\n\
+             ◐ partial changes: reached when parts change; full-screen changes stay at ~25 fps\n\
+             ⚠ small changes only: above the panel's ~61 fps limit, uses more CPU\n\
+             eco: saves CPU and USB bandwidth",
+        );
+        let fps_note = grey(label(&bx, fps_class(FPS_CHOICES[fps_index]).explanation()));
+        fps_note.wrap(300);
+        {
+            let (h, note, f) = (handle.clone(), fps_note, frame);
+            fps.on_selection_changed(move |e| {
+                if let Some(i) = e.get_selection() {
+                    let v = FPS_CHOICES[i as usize];
+                    note.set_label(fps_class(v).explanation());
+                    note.wrap(300);
+                    f.layout();
+                    h.borrow().update(|c| c.max_fps = v);
+                }
+            });
+        }
+        grid.add(&label(&bx, "Speed limit:"), 0, cv, 0);
+        grid.add(&fps, 0, cv, 0);
+        grid.add(&label(&bx, ""), 0, cv, 0);
+        grid.add(&label(&bx, ""), 0, cv, 0);
+        grid.add(&fps_note, 0, cv, 0);
+        grid.add(&label(&bx, ""), 0, cv, 0);
+
+        // mirror area
+        let region = TextCtrl::builder(&bx)
+            .with_value(&cfg.region.map(|r| format!("{},{},{},{}", r[0], r[1], r[2], r[3])).unwrap_or_default())
+            .build();
+        region.set_tooltip("x,y,width,height in pixels of the shared screen. Empty = everything.");
+        let apply = Button::builder(&bx).with_label("Apply").build();
+        {
+            let (h, region, f) = (handle.clone(), region, frame);
+            apply.on_click(move |_| {
+                let t = region.get_value();
+                let t = t.trim();
+                if t.is_empty() {
+                    h.borrow().update(|c| c.region = None);
+                    return;
+                }
+                let v: Vec<u32> = t.replace('x', ",").split(',').filter_map(|p| p.trim().parse().ok()).collect();
+                match <[u32; 4]>::try_from(v) {
+                    Ok(r) if r[2] > 0 && r[3] > 0 => h.borrow().update(|c| c.region = Some(r)),
+                    _ => {
+                        MessageDialog::builder(
+                            &f,
+                            "Enter the area as x,y,width,height, or leave it empty for everything.",
+                            "Open MSU2_MINI",
+                        )
+                        .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconWarning)
+                        .build()
+                        .show_modal();
+                    }
+                }
+            });
+        }
+        grid.add(&label(&bx, "Area (x,y,w,h):"), 0, cv, 0);
+        grid.add(&region, 1, SizerFlag::Expand | cv, 0);
+        grid.add(&apply, 0, cv, 0);
+
+        // which screen
+        #[cfg(target_os = "linux")]
+        {
+            let again = Button::builder(&bx).with_label("Choose screen / window again").build();
+            let h = handle.clone();
+            again.on_click(move |_| h.borrow().reselect_screen());
+            grid.add(&label(&bx, "Shared screen:"), 0, cv, 0);
+            grid.add(&again, 0, cv, 0);
+            grid.add(&label(&bx, ""), 0, cv, 0);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let names = crate::capture::monitor_names();
+            let mon = Choice::builder(&bx).with_choices(names.clone()).build();
+            if !names.is_empty() {
+                mon.set_selection(cfg.monitor.min(names.len() - 1) as u32);
+            }
+            let h = handle.clone();
+            mon.on_selection_changed(move |e| {
+                if let Some(i) = e.get_selection() {
+                    h.borrow().update(|c| c.monitor = i as usize);
+                }
+            });
+            grid.add(&label(&bx, "Monitor:"), 0, cv, 0);
+            grid.add(&mon, 0, cv, 0);
+            grid.add(&label(&bx, ""), 0, cv, 0);
+        }
+        pages.push((Mode::Mirror, finish_page(p, sb, Some(grid))));
+    }
+
+    // system monitor
+    {
+        let (p, sb, bx, grid) = new_page(Mode::Stats);
+        let stats_btn = Button::builder(&bx).with_label("Customize...").build();
+        stats_btn.set_tooltip("Choose the values, their order, the graphics and the colours.");
+        {
+            let (h, f) = (handle.clone(), frame);
+            stats_btn.on_click(move |_| {
+                let current = h.borrow().cfg.lock().unwrap().stats.clone();
+                if let Some(new) = crate::gui_stats::customize(&f, &current) {
+                    h.borrow().update(|c| c.stats = new);
+                }
+            });
+        }
+        grid.add(&label(&bx, "Values and look:"), 0, cv, 0);
+        grid.add(&stats_btn, 0, cv, 0);
+        grid.add(&label(&bx, ""), 0, cv, 0);
+        pages.push((Mode::Stats, finish_page(p, sb, Some(grid))));
+    }
+
+    // clock
+    {
+        let (p, sb, bx, grid) = new_page(Mode::Clock);
+        let bg_name = label(&bx, &file_name(&cfg.clock_background));
+        let bg_btns = BoxSizer::builder(Orientation::Horizontal).build();
+        let bg_btn = Button::builder(&bx).with_label("Choose...").build();
+        let bg_clear = Button::builder(&bx).with_label("×").with_style(ButtonStyle::ExactFit).build();
+        bg_clear.set_tooltip("No background picture");
+        {
+            let (h, f, name) = (handle.clone(), frame, bg_name);
+            bg_btn.on_click(move |_| {
+                if let Some(p) = pick_file(&f, "Choose a background picture for the clock") {
+                    name.set_label(&file_name(&Some(p.clone())));
+                    h.borrow().update(|c| c.clock_background = Some(p));
+                }
+            });
+            let (h, name) = (handle.clone(), bg_name);
+            bg_clear.on_click(move |_| {
+                name.set_label("none");
+                h.borrow().update(|c| c.clock_background = None);
+            });
+        }
+        bg_btns.add(&bg_btn, 0, cv, 0);
+        bg_btns.add(&bg_clear, 0, cv | SizerFlag::Left, 4);
+        grid.add(&label(&bx, "Background:"), 0, cv, 0);
+        grid.add(&bg_name, 0, cv, 0);
+        grid.add_sizer(&bg_btns, 0, cv, 0);
+        pages.push((Mode::Clock, finish_page(p, sb, Some(grid))));
+    }
+
+    // image and GIF
+    for (mode, what, title, wildcard) in [
+        (Mode::Image, "Picture:", "Choose a picture", IMAGE_WILDCARD),
+        (Mode::Gif, "Animated GIF:", "Choose an animated GIF", ANIM_WILDCARD),
+    ] {
+        let (p, sb, bx, grid) = new_page(mode);
+        let current = if mode == Mode::Image { &cfg.image } else { &cfg.gif };
+        let name = label(&bx, &file_name(current));
+        let btn = Button::builder(&bx).with_label("Choose...").build();
+        {
+            let (h, f) = (handle.clone(), frame);
+            btn.on_click(move |_| {
+                if let Some(p) = pick(&f, title, wildcard) {
+                    name.set_label(&file_name(&Some(p.clone())));
+                    h.borrow().update(|c| {
+                        if mode == Mode::Image {
+                            c.image = Some(p);
+                        } else {
+                            c.gif = Some(p);
+                        }
+                        c.mode = mode;
+                    });
+                }
+            });
+        }
+        grid.add(&label(&bx, what), 0, cv, 0);
+        grid.add(&name, 0, cv, 0);
+        grid.add(&btn, 0, cv, 0);
+        pages.push((mode, finish_page(p, sb, Some(grid))));
+    }
+
+    // video
+    #[cfg(feature = "video")]
+    {
+        let (p, sb, bx, grid) = new_page(Mode::Video);
+        let video_name = label(&bx, &file_name(&cfg.video));
+        let video_btn = Button::builder(&bx).with_label("Choose...").build();
+        video_btn.set_tooltip(if cfg!(target_os = "linux") {
+            "Videos are decoded by ffmpeg (install the ffmpeg package)."
+        } else if cfg!(windows) {
+            "Videos are decoded by ffmpeg: install it with\n\"winget install Gyan.FFmpeg\" or put ffmpeg.exe next to this program."
+        } else {
+            "MP4/MOV with H.264 works directly; other formats\n\
+             (WebM, MKV, AVI, HEVC, ...) need ffmpeg installed."
+        });
+        {
+            let (h, f, name) = (handle.clone(), frame, video_name);
+            video_btn.on_click(move |_| {
+                if let Some(p) = pick_video(&f) {
+                    name.set_label(&file_name(&Some(p.clone())));
+                    h.borrow().update(|c| {
+                        c.video = Some(p);
+                        c.mode = Mode::Video;
+                    });
+                }
+            });
+        }
+        grid.add(&label(&bx, "Video:"), 0, cv, 0);
+        grid.add(&video_name, 0, cv, 0);
+        grid.add(&video_btn, 0, cv, 0);
+
+        let video_sound = CheckBox::builder(&bx).with_label("Sound").build();
+        video_sound.set_value(cfg.video_sound);
+        video_sound.set_tooltip("Play the video's sound on the computer's default sound output.");
+        {
+            let (h, cb) = (handle.clone(), video_sound);
+            video_sound.on_toggled(move |_| {
+                let on = cb.get_value();
+                h.borrow().update(|c| c.video_sound = on);
+            });
+        }
+        let video_loop = CheckBox::builder(&bx).with_label("Loop").build();
+        video_loop.set_value(cfg.video_loop);
+        video_loop.set_tooltip("Start the video again at the end.\nOff: it plays once and its last picture stays.");
+        {
+            let (h, cb) = (handle.clone(), video_loop);
+            video_loop.on_toggled(move |_| {
+                let on = cb.get_value();
+                h.borrow().update(|c| c.video_loop = on);
+            });
+        }
+        let video_opts = BoxSizer::builder(Orientation::Horizontal).build();
+        video_opts.add(&video_sound, 0, cv, 0);
+        video_opts.add(&video_loop, 0, cv | SizerFlag::Left, 16);
+        grid.add(&label(&bx, "Playback:"), 0, cv, 0);
+        grid.add_sizer(&video_opts, 0, cv, 0);
+        grid.add(&label(&bx, ""), 0, cv, 0);
+        pages.push((Mode::Video, finish_page(p, sb, Some(grid))));
+    }
+
+    // YouTube
+    #[cfg(feature = "youtube")]
+    {
+        let p = Panel::builder(&book).build();
+        let sb = crate::gui_youtube::build(&p, frame, &handle, &cfg);
+        pages.push((Mode::YouTube, finish_page(p, sb, None)));
+    }
+
+    // the two slots on the device
+    let flash_state = Arc::new(Mutex::new(FlashState::default()));
+    let mut flash_buttons = Vec::new();
+    let mut gauges = Vec::new();
+    for (mode, text, tip) in [
+        (Mode::Album, "Upload Slot1 (image)...", "A still picture, kept on the device."),
+        (
+            Mode::Animation,
+            "Upload Slot2 (image or GIF)...",
+            "A picture or an animated GIF, kept on the device as 36 frames.\n\
+             For a folder of pictures (A0.png ... A35.png) use: open-msu2-mini flash slot2 FOLDER",
+        ),
+    ] {
+        let (p, sb, bx, _) = new_page(mode);
+        let btn = Button::builder(&bx).with_label(text).build();
+        btn.set_tooltip(tip);
+        let note = grey(label(
+            &bx,
+            "Stays on the device without PC: it shows Slot2, its button switches to Slot1.\n\
+             Brightness does not affect it; it is turned by the rotation set when uploading.",
+        ));
+        let gauge = Gauge::builder(&bx).with_range(100).build();
+        sb.add(&btn, 0, SizerFlag::All, 6);
+        sb.add(&note, 0, SizerFlag::Left | SizerFlag::Right | SizerFlag::Bottom, 6);
+        sb.add(&gauge, 0, SizerFlag::Expand | SizerFlag::Left | SizerFlag::Right | SizerFlag::Bottom, 6);
+        flash_buttons.push((mode == Mode::Animation, btn));
+        gauges.push(gauge);
+        pages.push((mode, finish_page(p, sb, None)));
+    }
+
+    for m in Mode::ALL {
+        let page = pages.iter().find(|(pm, _)| pm == m).map(|(_, p)| *p).expect("a page for every mode");
+        book.add_page(&page, m.label(), *m == cfg.mode, None);
+    }
+    root.add(&book, 0, SizerFlag::Expand | SizerFlag::Left | SizerFlag::Right | SizerFlag::Top, pad);
+
+    // -- general settings (all modes) -----------------------------------------------
+    let opt_box = StaticBoxSizerBuilder::new_with_label(Orientation::Vertical, &panel, "General").build();
     let op = opt_box.get_static_box().unwrap();
     let grid = FlexGridSizer::builder(0, 3).with_vgap(6).with_hgap(8).build();
     grid.add_growable_col(1, 1);
-    let label = |t: &str| StaticText::builder(&op).with_label(t).build();
-    let cv = SizerFlag::AlignCenterVertical;
 
     let rotation = Choice::builder(&op).with_choices(ROTATIONS.iter().map(|r| format!("{r}°")).collect()).build();
     rotation.set_selection(ROTATIONS.iter().position(|r| *r == cfg.rotation).unwrap_or(0) as u32);
@@ -181,6 +495,7 @@ fn build(cfg: Config, resume_background: bool) {
     }
     let fit = Choice::builder(&op).with_choices(Scaling::ALL.iter().map(|f| f.name().to_string()).collect()).build();
     fit.set_selection(Scaling::ALL.iter().position(|f| *f == cfg.fit).unwrap_or(0) as u32);
+    fit.set_tooltip("crop fills the screen and cuts off the edges, fit adds black bars, stretch distorts.");
     {
         let h = handle.clone();
         fit.on_selection_changed(move |e| {
@@ -190,43 +505,11 @@ fn build(cfg: Config, resume_background: bool) {
         });
     }
     let fit_row = BoxSizer::builder(Orientation::Horizontal).build();
-    fit_row.add(&label("Scaling:"), 0, cv | SizerFlag::Right, 6);
+    fit_row.add(&label(&op, "Scaling:"), 0, cv | SizerFlag::Right, 6);
     fit_row.add(&fit, 0, cv, 0);
-    grid.add(&label("Rotation:"), 0, cv, 0);
+    grid.add(&label(&op, "Rotation:"), 0, cv, 0);
     grid.add(&rotation, 0, cv, 0);
     grid.add_sizer(&fit_row, 0, SizerFlag::AlignRight, 0);
-
-    // frame-rate limit, each choice marked with how well the device can reach it
-    let fps = Choice::builder(&op).with_choices(FPS_CHOICES.iter().map(|f| fps_label(*f)).collect()).build();
-    let fps_index = FPS_CHOICES.iter().position(|f| *f >= cfg.max_fps - 0.001).unwrap_or(FPS_CHOICES.len() - 1);
-    fps.set_selection(fps_index as u32);
-    fps.set_tooltip(
-        "✓ full screen: reached even when the whole picture changes\n\
-         ◐ partial changes: reached when parts change; full-screen changes stay at ~25 fps\n\
-         ⚠ small changes only: above the panel's ~61 fps limit, uses more CPU\n\
-         eco: saves CPU and USB bandwidth",
-    );
-    let fps_note = StaticText::builder(&op).with_label(fps_class(FPS_CHOICES[fps_index]).explanation()).build();
-    fps_note.set_foreground_color(Colour::new(128, 128, 128, 255));
-    fps_note.wrap(300);
-    {
-        let (h, note, f) = (handle.clone(), fps_note, frame);
-        fps.on_selection_changed(move |e| {
-            if let Some(i) = e.get_selection() {
-                let v = FPS_CHOICES[i as usize];
-                note.set_label(fps_class(v).explanation());
-                note.wrap(300);
-                f.layout();
-                h.borrow().update(|c| c.max_fps = v);
-            }
-        });
-    }
-    grid.add(&label("Mirror speed limit:"), 0, cv, 0);
-    grid.add(&fps, 0, cv, 0);
-    grid.add(&label(""), 0, cv, 0);
-    grid.add(&label(""), 0, cv, 0);
-    grid.add(&fps_note, 0, cv, 0);
-    grid.add(&label(""), 0, cv, 0);
 
     // brightness
     let levels: Vec<u8> = (MIN_BRIGHTNESS..=100).rev().step_by(10).collect();
@@ -245,221 +528,9 @@ fn build(cfg: Config, resume_background: bool) {
             }
         });
     }
-    let bright_row = BoxSizer::builder(Orientation::Horizontal).build();
-    bright_row.add(&bright, 0, cv, 0);
-    let bright_note = StaticText::builder(&op).with_label("Slot1 / Slot2 on the device are not affected.").build();
-    bright_row.add(&bright_note, 0, cv | SizerFlag::Left, 10);
-    grid.add(&label("Brightness:"), 0, cv, 0);
-    grid.add_sizer(&bright_row, 0, cv, 0);
-    grid.add(&label(""), 0, cv, 0);
-
-    // system monitor
-    let stats_btn = Button::builder(&op).with_label("Customize...").build();
-    {
-        let (h, f) = (handle.clone(), frame);
-        stats_btn.on_click(move |_| {
-            let current = h.borrow().cfg.lock().unwrap().stats.clone();
-            if let Some(new) = crate::gui_stats::customize(&f, &current) {
-                h.borrow().update(|c| c.stats = new);
-            }
-        });
-    }
-    grid.add(&label("System monitor:"), 0, cv, 0);
-    grid.add(&stats_btn, 0, cv, 0);
-    grid.add(&label(""), 0, cv, 0);
-
-    // mirror area
-    let region = TextCtrl::builder(&op)
-        .with_value(&cfg.region.map(|r| format!("{},{},{},{}", r[0], r[1], r[2], r[3])).unwrap_or_default())
-        .build();
-    region.set_tooltip("x,y,width,height in pixels of the shared screen. Empty = everything.");
-    let apply = Button::builder(&op).with_label("Apply").build();
-    {
-        let (h, region, f) = (handle.clone(), region, frame);
-        apply.on_click(move |_| {
-            let t = region.get_value();
-            let t = t.trim();
-            if t.is_empty() {
-                h.borrow().update(|c| c.region = None);
-                return;
-            }
-            let v: Vec<u32> = t.replace('x', ",").split(',').filter_map(|p| p.trim().parse().ok()).collect();
-            match <[u32; 4]>::try_from(v) {
-                Ok(r) if r[2] > 0 && r[3] > 0 => h.borrow().update(|c| c.region = Some(r)),
-                _ => {
-                    MessageDialog::builder(
-                        &f,
-                        "Enter the area as x,y,width,height, or leave it empty for everything.",
-                        "Open MSU2_MINI",
-                    )
-                    .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconWarning)
-                    .build()
-                    .show_modal();
-                }
-            }
-        });
-    }
-    grid.add(&label("Mirror area (x,y,w,h):"), 0, cv, 0);
-    grid.add(&region, 1, SizerFlag::Expand | cv, 0);
-    grid.add(&apply, 0, cv, 0);
-
-    // which screen
-    #[cfg(target_os = "linux")]
-    {
-        let again = Button::builder(&op).with_label("Choose screen / window again").build();
-        let h = handle.clone();
-        let radios2 = radios.clone();
-        again.on_click(move |_| {
-            h.borrow().reselect_screen();
-            for (m, rb) in &radios2 {
-                rb.set_value(*m == Mode::Mirror);
-            }
-        });
-        grid.add(&label("Shared screen:"), 0, cv, 0);
-        grid.add(&again, 0, cv, 0);
-        grid.add(&label(""), 0, cv, 0);
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let names = crate::capture::monitor_names();
-        let mon = Choice::builder(&op).with_choices(names.clone()).build();
-        if !names.is_empty() {
-            mon.set_selection(cfg.monitor.min(names.len() - 1) as u32);
-        }
-        let h = handle.clone();
-        mon.on_selection_changed(move |e| {
-            if let Some(i) = e.get_selection() {
-                h.borrow().update(|c| c.monitor = i as usize);
-            }
-        });
-        grid.add(&label("Monitor:"), 0, cv, 0);
-        grid.add(&mon, 0, cv, 0);
-        grid.add(&label(""), 0, cv, 0);
-    }
-
-    // image + clock background
-    let image_name = StaticText::builder(&op).with_label(&file_name(&cfg.image)).build();
-    let image_btn = Button::builder(&op).with_label("Choose...").build();
-    {
-        let (h, f, name, radios2) = (handle.clone(), frame, image_name, radios.clone());
-        image_btn.on_click(move |_| {
-            if let Some(p) = pick_file(&f, "Choose a picture") {
-                name.set_label(&file_name(&Some(p.clone())));
-                h.borrow().update(|c| {
-                    c.image = Some(p);
-                    c.mode = Mode::Image;
-                });
-                for (m, rb) in &radios2 {
-                    rb.set_value(*m == Mode::Image);
-                }
-            }
-        });
-    }
-    grid.add(&label("Image:"), 0, cv, 0);
-    grid.add(&image_name, 0, cv, 0);
-    grid.add(&image_btn, 0, cv, 0);
-
-    let gif_name = StaticText::builder(&op).with_label(&file_name(&cfg.gif)).build();
-    let gif_btn = Button::builder(&op).with_label("Choose...").build();
-    {
-        let (h, f, name, radios2) = (handle.clone(), frame, gif_name, radios.clone());
-        gif_btn.on_click(move |_| {
-            if let Some(p) = pick(&f, "Choose an animated GIF", ANIM_WILDCARD) {
-                name.set_label(&file_name(&Some(p.clone())));
-                h.borrow().update(|c| {
-                    c.gif = Some(p);
-                    c.mode = Mode::Gif;
-                });
-                for (m, rb) in &radios2 {
-                    rb.set_value(*m == Mode::Gif);
-                }
-            }
-        });
-    }
-    grid.add(&label("GIF:"), 0, cv, 0);
-    grid.add(&gif_name, 0, cv, 0);
-    grid.add(&gif_btn, 0, cv, 0);
-
-    let video_name = StaticText::builder(&op).with_label(&file_name(&cfg.video)).build();
-    let video_btn = Button::builder(&op).with_label("Choose...").build();
-    video_btn.set_tooltip(if cfg!(target_os = "linux") {
-        "Videos are decoded by ffmpeg (install the ffmpeg package)."
-    } else if cfg!(windows) {
-        "Videos are decoded by ffmpeg: install it with\n\"winget install Gyan.FFmpeg\" or put ffmpeg.exe next to this program."
-    } else {
-        "MP4/MOV with H.264 works directly; other formats\n\
-         (WebM, MKV, AVI, HEVC, ...) need ffmpeg installed."
-    });
-    {
-        let (h, f, name, radios2) = (handle.clone(), frame, video_name, radios.clone());
-        video_btn.on_click(move |_| {
-            if let Some(p) = pick_video(&f) {
-                name.set_label(&file_name(&Some(p.clone())));
-                h.borrow().update(|c| {
-                    c.video = Some(p);
-                    c.mode = Mode::Video;
-                });
-                for (m, rb) in &radios2 {
-                    rb.set_value(*m == Mode::Video);
-                }
-            }
-        });
-    }
-    grid.add(&label("Video:"), 0, cv, 0);
-    grid.add(&video_name, 0, cv, 0);
-    grid.add(&video_btn, 0, cv, 0);
-
-    let video_sound = CheckBox::builder(&op).with_label("Sound").build();
-    video_sound.set_value(cfg.video_sound);
-    video_sound.set_tooltip("Play the video's sound on the computer's default sound output.");
-    {
-        let (h, cb) = (handle.clone(), video_sound);
-        video_sound.on_toggled(move |_| {
-            let on = cb.get_value();
-            h.borrow().update(|c| c.video_sound = on);
-        });
-    }
-    let video_loop = CheckBox::builder(&op).with_label("Loop").build();
-    video_loop.set_value(cfg.video_loop);
-    video_loop.set_tooltip("Start the video again at the end.\nOff: it plays once and its last picture stays.");
-    {
-        let (h, cb) = (handle.clone(), video_loop);
-        video_loop.on_toggled(move |_| {
-            let on = cb.get_value();
-            h.borrow().update(|c| c.video_loop = on);
-        });
-    }
-    let video_opts = BoxSizer::builder(Orientation::Horizontal).build();
-    video_opts.add(&video_sound, 0, cv, 0);
-    video_opts.add(&video_loop, 0, cv | SizerFlag::Left, 16);
-    grid.add(&label("Video playback:"), 0, cv, 0);
-    grid.add_sizer(&video_opts, 0, cv, 0);
-    grid.add(&label(""), 0, cv, 0);
-
-    let bg_name = StaticText::builder(&op).with_label(&file_name(&cfg.clock_background)).build();
-    let bg_btns = BoxSizer::builder(Orientation::Horizontal).build();
-    let bg_btn = Button::builder(&op).with_label("Choose...").build();
-    let bg_clear = Button::builder(&op).with_label("×").with_style(ButtonStyle::ExactFit).build();
-    bg_clear.set_tooltip("No background picture");
-    {
-        let (h, f, name) = (handle.clone(), frame, bg_name);
-        bg_btn.on_click(move |_| {
-            if let Some(p) = pick_file(&f, "Choose a background picture for the clock") {
-                name.set_label(&file_name(&Some(p.clone())));
-                h.borrow().update(|c| c.clock_background = Some(p));
-            }
-        });
-        let (h, name) = (handle.clone(), bg_name);
-        bg_clear.on_click(move |_| {
-            name.set_label("none");
-            h.borrow().update(|c| c.clock_background = None);
-        });
-    }
-    bg_btns.add(&bg_btn, 0, cv, 0);
-    bg_btns.add(&bg_clear, 0, cv | SizerFlag::Left, 4);
-    grid.add(&label("Clock background:"), 0, cv, 0);
-    grid.add(&bg_name, 0, cv, 0);
-    grid.add_sizer(&bg_btns, 0, cv, 0);
+    grid.add(&label(&op, "Brightness:"), 0, cv, 0);
+    grid.add(&bright, 0, cv, 0);
+    grid.add(&label(&op, ""), 0, cv, 0);
 
     // window: taskbar / notification area, start minimized
     let tray_choice =
@@ -482,37 +553,13 @@ fn build(cfg: Config, resume_background: bool) {
             h.borrow().update(|c| c.start_minimized = on);
         });
     }
-    grid.add(&label("Window icon in:"), 0, cv, 0);
+    grid.add(&label(&op, "Window icon in:"), 0, cv, 0);
     grid.add(&tray_choice, 0, cv, 0);
     grid.add(&start_min, 0, cv, 0);
 
     opt_box.add_sizer(&grid, 0, SizerFlag::Expand | SizerFlag::All, 6);
     root.add_sizer(&opt_box, 0, SizerFlag::Expand | SizerFlag::Left | SizerFlag::Right | SizerFlag::Top, pad);
 
-    // -- flash ----------------------------------------------------------------------
-    let fl_box =
-        StaticBoxSizerBuilder::new_with_label(Orientation::Vertical, &panel, "Store on the device (stays without PC)")
-            .build();
-    let fp = fl_box.get_static_box().unwrap();
-    let fl_row = BoxSizer::builder(Orientation::Horizontal).build();
-    let album_btn = Button::builder(&fp).with_label("Upload Slot1 (image)...").build();
-    album_btn.set_tooltip("A still picture, kept on the device (mode \"Slot1 on device\").");
-    let anim_btn = Button::builder(&fp).with_label("Upload Slot2 (image or GIF)...").build();
-    anim_btn.set_tooltip(
-        "A picture or an animated GIF, kept on the device as 36 frames (mode \"Slot2 on device\").\n\
-         For a folder of pictures (A0.png ... A35.png) use: open-msu2-mini flash slot2 FOLDER",
-    );
-    fl_row.add(&album_btn, 0, SizerFlag::Right, 8);
-    fl_row.add(&anim_btn, 0, SizerFlag::Right, 0);
-    let fl_note =
-        StaticText::builder(&fp).with_label("Without PC the device shows Slot2; its button switches to Slot1.").build();
-    let gauge = Gauge::builder(&fp).with_range(100).build();
-    fl_box.add_sizer(&fl_row, 0, SizerFlag::All, 6);
-    fl_box.add(&fl_note, 0, SizerFlag::Left | SizerFlag::Right | SizerFlag::Bottom, 6);
-    fl_box.add(&gauge, 0, SizerFlag::Expand | SizerFlag::Left | SizerFlag::Right | SizerFlag::Bottom, 6);
-    root.add_sizer(&fl_box, 0, SizerFlag::Expand | SizerFlag::Left | SizerFlag::Right | SizerFlag::Top, pad);
-
-    let flash_state = Arc::new(Mutex::new(FlashState::default()));
     let start_flash = {
         let (h, st, f) = (handle.clone(), flash_state.clone(), frame);
         Rc::new(move |animation: bool| {
@@ -548,11 +595,9 @@ fn build(cfg: Config, resume_background: bool) {
             );
         })
     };
-    {
-        let s = start_flash.clone();
-        album_btn.on_click(move |_| s(false));
-        let s = start_flash.clone();
-        anim_btn.on_click(move |_| s(true));
+    for (animation, btn) in &flash_buttons {
+        let (s, animation) = (start_flash.clone(), *animation);
+        btn.on_click(move |_| s(animation));
     }
 
     let tip = StaticText::builder(&panel).with_label("Tip: the button on the device cycles through the modes.").build();
@@ -617,7 +662,7 @@ fn build(cfg: Config, resume_background: bool) {
     let timer = Rc::new(Timer::new(&frame));
     {
         let (h, st, f) = (handle.clone(), flash_state.clone(), frame);
-        let buttons = [album_btn, anim_btn];
+        let buttons: Vec<Button> = flash_buttons.iter().map(|(_, b)| *b).collect();
         let last_text = RefCell::new(String::new());
         let last_mode = RefCell::new(cfg.mode);
         let (tray, quit) = (tray.clone(), quit.clone());
@@ -639,8 +684,10 @@ fn build(cfg: Config, resume_background: bool) {
             }
             let r = if s.connected
                 && s.fps > 0.0
-                && matches!(s.mode, Mode::Mirror | Mode::Animation | Mode::Image | Mode::Gif | Mode::Video)
-            {
+                && matches!(
+                    s.mode,
+                    Mode::Mirror | Mode::Animation | Mode::Image | Mode::Gif | Mode::Video | Mode::YouTube
+                ) {
                 format!("{:.0} fps · {:.0} KB/s", s.fps, s.kbps)
             } else {
                 String::new()
@@ -655,6 +702,7 @@ fn build(cfg: Config, resume_background: bool) {
                 for (m, rb) in &radios {
                     rb.set_value(*m == mode);
                 }
+                book.set_selection(page_of(mode));
                 if let Some(t) = tray.borrow().as_ref() {
                     t.set_mode(mode);
                 }
@@ -664,11 +712,15 @@ fn build(cfg: Config, resume_background: bool) {
                 b.enable(!fs.busy);
             }
             if fs.busy {
-                gauge.set_value((100 * fs.done).checked_div(fs.total).unwrap_or(0) as i32);
+                for g in &gauges {
+                    g.set_value((100 * fs.done).checked_div(fs.total).unwrap_or(0) as i32);
+                }
             }
             if let Some(res) = fs.result.take() {
                 fs.busy = false;
-                gauge.set_value(0);
+                for g in &gauges {
+                    g.set_value(0);
+                }
                 drop(fs);
                 let (msg, style) = match res {
                     Ok(()) => ("Written to the device.".to_string(), MessageDialogStyle::IconInformation),
@@ -714,6 +766,7 @@ fn pick_file(parent: &Frame, title: &str) -> Option<PathBuf> {
     pick(parent, title, IMAGE_WILDCARD)
 }
 
+#[cfg(feature = "video")]
 fn pick_video(parent: &Frame) -> Option<PathBuf> {
     let pattern: Vec<String> = crate::video::EXTENSIONS.iter().map(|e| format!("*.{e}")).collect();
     let pattern = pattern.join(";");

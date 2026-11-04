@@ -46,6 +46,7 @@ overrides:
       - libudev1
     recommends:
       - ffmpeg
+      - yt-dlp
   rpm: # Fedora and openSUSE: library names, the package names differ between the two
     depends:
       - libc.so.6(GLIBC_2.39)(64bit)
@@ -59,6 +60,7 @@ overrides:
       # each one is optional: Fedora has ffmpeg-free (RPM Fusion: ffmpeg), openSUSE ffmpeg
       - ffmpeg-free
       - ffmpeg
+      - yt-dlp
   archlinux:
     depends:
       - glibc
@@ -69,4 +71,5 @@ overrides:
       - libsm
       - systemd-libs
     suggests:
-      - "ffmpeg: video mode"
+      - "ffmpeg: video and YouTube modes"
+      - "yt-dlp: YouTube mode"

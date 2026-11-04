@@ -19,12 +19,16 @@ It replaces the vendor's Windows-only demo tool and runs on **Linux, Windows and
   and in a loop. Decoded by [ffmpeg](https://ffmpeg.org), every format it knows (Linux:
   the system's package; Windows: `winget install Gyan.FFmpeg`). On macOS MP4/MOV with
   H.264 plays without it, other formats (WebM, MKV, AVI, HEVC, ...) need ffmpeg installed.
+- **YouTube**: live streams and videos, with sound on/off, play/stop and favourites. The
+  stream is found by [yt-dlp](https://github.com/yt-dlp/yt-dlp) and decoded by ffmpeg, so
+  both must be installed; other sites yt-dlp supports (e.g. Twitch) work too. A live stream
+  that breaks off is connected again.
 - **Two slots on the device**: Slot1 holds an image, Slot2 an image or a GIF. Without a PC
   the device shows Slot2 by itself, and its button switches to Slot1.
 - **Rotation by 0°, 90°, 180° or 270°.** At 90° and 270° the screen can stand upright; the
   system monitor and the clock then use portrait layouts.
 - The **button on the device** cycles through all modes (Image, GIF and Video once a file is
-  chosen for them).
+  chosen for them, YouTube once an address is entered).
 - **Native window** that follows your desktop theme: GTK on Linux, Win32 with dark mode on
   Windows, Cocoa on macOS. Optionally with an icon in the notification area (system tray)
   and started minimized.
@@ -50,8 +54,8 @@ Download the executable for your system from the
 | System | Notes |
 |---|---|
 | **Linux** x86_64 | Packages for Ubuntu/Debian, Fedora/openSUSE and Arch, or a single executable; see [Linux](#linux) below. |
-| **Windows** 10/11 | Just run the `.exe`; no driver needed. For videos install [ffmpeg](https://ffmpeg.org): `winget install Gyan.FFmpeg` (or put `ffmpeg.exe` next to the program). |
-| **macOS** | Allow "Screen Recording" for the app (or your terminal) to mirror the screen. Videos in formats other than MP4/H.264 need ffmpeg (`brew install ffmpeg`). |
+| **Windows** 10/11 | Just run the `.exe`; no driver needed. For videos install [ffmpeg](https://ffmpeg.org): `winget install Gyan.FFmpeg` (or put `ffmpeg.exe` next to the program). For YouTube also `winget install yt-dlp.yt-dlp`. |
+| **macOS** | Allow "Screen Recording" for the app (or your terminal) to mirror the screen. Videos in formats other than MP4/H.264 need ffmpeg (`brew install ffmpeg`); YouTube needs ffmpeg and yt-dlp (`brew install ffmpeg yt-dlp`). |
 
 ### Linux
 
@@ -96,7 +100,13 @@ the udev rule, and reports missing libraries. **Device access:** without the ude
 group that owns serial ports and log in again: `sudo usermod -aG dialout $USER` (Arch:
 `uucp` instead of `dialout`).
 
-**ffmpeg** is only needed for the video mode. Fedora's `ffmpeg-free` and openSUSE's
+**yt-dlp** is only needed for the YouTube mode (`sudo apt install yt-dlp`,
+`sudo dnf install yt-dlp`, `sudo pacman -S yt-dlp`, `sudo zypper install yt-dlp`). YouTube
+changes often: if streams stop working, update yt-dlp (`pip install -U yt-dlp` or the
+[latest release](https://github.com/yt-dlp/yt-dlp/releases)); recent versions also want a
+JavaScript runtime such as [Deno](https://deno.com) for YouTube.
+
+**ffmpeg** is only needed for the video and YouTube modes. Fedora's `ffmpeg-free` and openSUSE's
 `ffmpeg` play common videos (tested: H.264 with AAC, VP9 with Opus). For HEVC and other
 patented formats, install the full ffmpeg from [RPM Fusion](https://rpmfusion.org) (Fedora:
 `sudo dnf swap ffmpeg-free ffmpeg --allowerasing`) or
@@ -109,9 +119,11 @@ Start the program without arguments to open the window. On the command line:
 ```sh
 open-msu2-mini                          # window
 open-msu2-mini run                      # no window, saved settings (for autostart)
-open-msu2-mini run stats                # modes: mirror stats clock image gif video slot1 slot2
+open-msu2-mini run stats                # modes: mirror stats clock image gif video youtube slot1 slot2
 open-msu2-mini run --gif cat.gif --brightness 50   # GIF mode at half brightness
 open-msu2-mini run --video clip.mp4 --sound --loop=false   # play once, with sound
+open-msu2-mini run --youtube https://www.youtube.com/@LofiGirl/live --sound   # a YouTube live stream
+open-msu2-mini run --youtube "Lofi"     # a YouTube favourite, by its name
 open-msu2-mini run mirror --region 0,0,1280,640 --fps 60
 open-msu2-mini run stats --rotate 90    # rotation: 0, 90, 180 or 270 (works with run/show/flash)
 open-msu2-mini run mirror --fps 0.5     # slowest: one picture every two seconds
@@ -137,8 +149,21 @@ open-msu2-mini --help
   | ◐ partial changes | 30–60 fps | Reached when parts of the screen change; full-screen changes stay at ~25 fps |
   | ⚠ small changes only | 90–120 fps | Above the panel's ~61 fps limit: only small changes (mouse, small video) reach it; more CPU |
 
-- **System monitor:** choose the values, their order and the look under *System monitor →
-  Customize…* in the window (or edit the `stats` section of the settings file).
+- **Window:** choose a mode at the top; below it the window shows that mode's settings
+  (they change with the mode, also when the device's button switches it). Rotation,
+  scaling, brightness and the window icon are under *General*, for all modes.
+- **System monitor:** choose the values, their order and the look with *Customize…* on the
+  System monitor page (or edit the `stats` section of the settings file).
+- **YouTube:** enter the address of a live stream or video on the YouTube page and press *Play*
+  (or Enter). A channel's `https://www.youtube.com/@name/live` address always plays its
+  current live stream. *Stop* stops it, *Sound* switches the sound on and off without
+  interrupting the stream. *Add...* saves the address as a favourite (named after the stream's
+  title); choosing a favourite plays it. The picture is played at 240p (plenty for the
+  screen, and it saves bandwidth), the sound in the best quality there is (live streams:
+  AAC ~128 kbps; videos: usually Opus ~130–160 kbps or AAC 128 kbps). Videos play once; their
+  last picture stays. Choosing the YouTube mode (in the window, the tray menu or with the
+  device's button) plays the last address by itself after two seconds. When the screen is
+  unplugged, the stream stops; press *Play* or choose the mode again to start it again.
 - **Slots on the device:** *Upload Slot1 (image)…* and *Upload Slot2 (image or GIF)…* keep
   a picture and a picture or GIF in the device's flash; the modes *Slot1 on device* and
   *Slot2 on device* show them. Without a PC the device shows Slot2, and its button switches
@@ -208,8 +233,17 @@ automatically on the first build, which takes a few minutes.
 
 ```sh
 cargo build --release                       # target/release/open-msu2-mini
-cargo build --release --no-default-features # without the window (no wxWidgets)
+cargo build --release --no-default-features --features video,youtube  # without the window (no wxWidgets)
+cargo build --release --no-default-features --features gui            # without video and YouTube
 ```
+
+Optional parts (Cargo features, all on by default):
+
+| Feature | Contents |
+|---|---|
+| `gui` | The control window (wxWidgets) |
+| `video` | Video mode with sound (ffmpeg at run time; on macOS built-in MP4/H.264 decoding) |
+| `youtube` | YouTube mode (yt-dlp and ffmpeg at run time); includes `video` |
 
 **Linux and Windows executables from Linux, with Docker** (Ubuntu 24.04 build environment;
 Windows is cross-compiled with Zig):
@@ -233,7 +267,8 @@ Apple Silicon) on every push. A `v*` tag publishes the executables as a release.
 | `src/stats.rs` | System monitor |
 | `src/render.rs`, `src/scale.rs` | Clock, pictures, text; scaling to the panel or a portrait canvas |
 | `src/video.rs`, `src/audio.rs` | Video playback and its sound: ffmpeg (Linux, Windows; macOS: OpenH264 and Symphonia, ffmpeg for other formats), output with cpal |
-| `src/gui.rs`, `src/gui_stats.rs` | Window and system monitor settings (wxWidgets) |
+| `src/youtube.rs` | YouTube mode: finds the stream with yt-dlp, plays it with `video.rs`, connects again |
+| `src/gui.rs`, `src/gui_stats.rs`, `src/gui_youtube.rs` | Window, system monitor settings and YouTube controls (wxWidgets) |
 | `src/main.rs` | Command line, benchmark |
 | `build/` | Docker build environment and scripts |
 | `packaging/linux/` | Installer, desktop entry, udev rule |

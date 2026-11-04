@@ -26,11 +26,17 @@ sysinfo = "0.40"
 chrono = "0.4"
 # appindicator: tray icon via StatusNotifier (KDE, GNOME + extension, Wayland); Linux only
 wxdragon = { version = "0.9", optional = true, default-features = false, features = ["appindicator"] }
-cpal = "0.18"
+# sound for the video and YouTube modes
+cpal = { version = "0.18", optional = true }
 
 [features]
-default = ["gui"]
+default = ["gui", "video", "youtube"]
+# control window (wxWidgets)
 gui = ["dep:wxdragon"]
+# video mode: plays video files (ffmpeg; macOS: built-in MP4/H.264 too), with sound
+video = ["dep:cpal", "dep:mp4", "dep:openh264", "dep:symphonia"]
+# YouTube mode: live streams and videos from YouTube, through yt-dlp and ffmpeg
+youtube = ["video"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ashpd = { version = "0.13", default-features = false, features = ["async-io", "screencast"] }
@@ -45,9 +51,9 @@ xcap = "0.9"
 
 # video mode on macOS (Linux and Windows use ffmpeg): MP4 container, H.264 and sound decoders
 [target.'cfg(target_os = "macos")'.dependencies]
-mp4 = "0.14"
-openh264 = "0.9"
-symphonia = { version = "0.6", default-features = false, features = ["aac", "isomp4", "mp3", "pcm", "flac", "vorbis", "mkv", "wav", "ogg", "adpcm"] }
+mp4 = { version = "0.14", optional = true }
+openh264 = { version = "0.9", optional = true }
+symphonia = { version = "0.6", optional = true, default-features = false, features = ["aac", "isomp4", "mp3", "pcm", "flac", "vorbis", "mkv", "wav", "ogg", "adpcm"] }
 
 [build-dependencies]
 embed-manifest = "1.4"
