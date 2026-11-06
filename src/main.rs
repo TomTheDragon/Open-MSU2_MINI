@@ -95,7 +95,7 @@ impl From<FitArg> for Scaling {
 
 #[derive(Clone, Copy, ValueEnum)]
 enum FlashWhat {
-    /// Slot1: a picture (offline, the device's button switches to it)
+    /// Slot1: a picture (offline, the device's touch button switches to it)
     #[value(name = "slot1", alias = "image", alias = "album", alias = "clock-background")]
     Image,
     /// Slot2: a GIF, a picture or a folder of pictures (shown offline)
@@ -106,7 +106,12 @@ enum FlashWhat {
 #[derive(Subcommand)]
 enum Cmd {
     /// Open the control window (default)
-    Gui,
+    Gui {
+        /// Started because the screen was plugged in (Linux, see "Open when plugged in"):
+        /// do nothing when the window or a background instance already runs
+        #[arg(long, hide = true)]
+        plugged: bool,
+    },
     /// Run without a window, using the saved settings (options override them)
     Run {
         mode: Option<ModeArg>,
@@ -154,7 +159,7 @@ enum Cmd {
         youtube: Option<String>,
         #[arg(long)]
         clock_background: Option<PathBuf>,
-        /// Ignore the push button on the device
+        /// Ignore the touch button on the device
         #[arg(long)]
         no_button: bool,
         /// Store the given options as new defaults
@@ -246,8 +251,11 @@ fn attach_console() {
 fn run(cli: Cli) -> Result<()> {
     let rotation: Option<u16> = cli.rotate.as_deref().map(|r| r.parse().unwrap());
     let saved_rotation = || rotation.unwrap_or_else(|| Config::load().rotation);
-    match cli.cmd.unwrap_or(Cmd::Gui) {
-        Cmd::Gui => {
+    match cli.cmd.unwrap_or(Cmd::Gui { plugged: false }) {
+        Cmd::Gui { plugged } => {
+            if plugged && (config::gui_pid().is_some() || config::background_pid().is_some()) {
+                return Ok(()); // already looked after
+            }
             #[cfg(feature = "gui")]
             return gui::run(cli.port);
             #[cfg(not(feature = "gui"))]
@@ -335,7 +343,8 @@ fn run(cli: Cli) -> Result<()> {
             }
             #[cfg(feature = "youtube")]
             if let Some(y) = youtube {
-                cfg.youtube_url = Some(youtube::favorite_url(&cfg.youtube_favorites, &y));
+                let url = youtube::favorite_url(&cfg.youtube_favorites, &y);
+                cfg.set_youtube_url(url);
                 cfg.youtube_playing = true;
                 if mode.is_none() {
                     cfg.mode = Mode::YouTube;
@@ -485,7 +494,7 @@ fn ctrlc_handler(f: impl Fn() + Send + 'static) -> Result<()> {
     Ok(())
 }
 
-/// Keep the connection alive (button polling) for `dur`.
+/// Keep the connection alive (touch button polling) for `dur`.
 fn keep_alive(d: &mut Device, dur: Duration) -> Result<()> {
     let end = Instant::now() + dur;
     while Instant::now() < end {

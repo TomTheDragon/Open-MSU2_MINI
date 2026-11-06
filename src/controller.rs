@@ -10,7 +10,8 @@ use crate::stats::StatsScreen;
 use crate::video::{Playback, VideoScreen};
 #[cfg(feature = "youtube")]
 use crate::youtube::YouTubeScreen;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -29,7 +30,22 @@ pub struct Status {
     pub mode: Mode,
     /// Title of what is playing (YouTube)
     pub title: Option<String>,
+    /// Video / YouTube: playing, paused or not playing (for the Play / Pause button)
+    pub media: Media,
 }
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Media {
+    #[default]
+    Idle,
+    Playing,
+    Paused,
+}
+
+/// Requests from the window for what plays (`Handle::media_cmd`)
+const MEDIA_NONE: u8 = 0;
+const MEDIA_PLAY_PAUSE: u8 = 1;
+const MEDIA_STOP: u8 = 2;
 
 pub struct Handle {
     pub cfg: Arc<Mutex<Config>>,
@@ -41,6 +57,8 @@ pub struct Handle {
     youtube_restart: Arc<AtomicBool>,
     #[cfg_attr(not(feature = "youtube"), allow(dead_code))]
     youtube_sound: Arc<AtomicBool>,
+    #[cfg_attr(not(feature = "video"), allow(dead_code))]
+    media_cmd: Arc<AtomicU8>,
     stop: Arc<AtomicBool>,
     jobs: mpsc::Sender<(Job, JobDone)>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -71,7 +89,7 @@ impl Handle {
     pub fn play_youtube(&self, url: String) {
         self.youtube_restart.store(true, Ordering::SeqCst);
         self.update(|c| {
-            c.youtube_url = Some(url);
+            c.set_youtube_url(url);
             c.youtube_playing = true;
             c.mode = Mode::YouTube;
         });
@@ -83,6 +101,17 @@ impl Handle {
         c.youtube_sound = on;
         c.save();
         self.youtube_sound.store(on, Ordering::SeqCst);
+    }
+    /// Video / YouTube: pause or go on; starts it when it is stopped or has ended (like a
+    /// tap on the touch button).
+    #[cfg_attr(not(feature = "video"), allow(dead_code))]
+    pub fn play_pause(&self) {
+        self.media_cmd.store(MEDIA_PLAY_PAUSE, Ordering::SeqCst);
+    }
+    /// Video / YouTube: stop.
+    #[cfg_attr(not(feature = "video"), allow(dead_code))]
+    pub fn stop_media(&self) {
+        self.media_cmd.store(MEDIA_STOP, Ordering::SeqCst);
     }
     pub fn run_job(&self, job: Job, done: JobDone) {
         let _ = self.jobs.send((job, done));
@@ -113,6 +142,7 @@ pub fn spawn(cfg: Config, use_button: bool, on_status: impl Fn(&Status) + Send +
     let youtube_restart = Arc::new(AtomicBool::new(false));
     let youtube_sound = Arc::new(AtomicBool::new(cfg.lock().unwrap().youtube_sound));
     let stop = Arc::new(AtomicBool::new(false));
+    let media_cmd = Arc::new(AtomicU8::new(MEDIA_NONE));
     let (tx, rx) = mpsc::channel();
     let mut c = Controller {
         cfg: cfg.clone(),
@@ -123,6 +153,8 @@ pub fn spawn(cfg: Config, use_button: bool, on_status: impl Fn(&Status) + Send +
         youtube_restart: youtube_restart.clone(),
         youtube_sound: youtube_sound.clone(),
         youtube_key: None,
+        media_cmd: media_cmd.clone(),
+        video_stopped: None,
         stop: stop.clone(),
         jobs: rx,
         on_status: Box::new(on_status),
@@ -136,9 +168,12 @@ pub fn spawn(cfg: Config, use_button: bool, on_status: impl Fn(&Status) + Send +
         flipped: None,
         rotation: 0,
         baseline: None,
-        key_down: false,
+        touch: Touch::default(),
         next_poll: Instant::now(),
         anim_frame: 0,
+        paused: false,
+        just_connected: false,
+        connected_text: String::new(),
         meter: Meter::default(),
         dimmer: None,
     };
@@ -151,6 +186,7 @@ pub fn spawn(cfg: Config, use_button: bool, on_status: impl Fn(&Status) + Send +
         reconnect,
         youtube_restart,
         youtube_sound,
+        media_cmd,
         stop,
         jobs: tx,
         thread: Some(thread),
@@ -174,6 +210,9 @@ struct Controller {
     youtube_sound: Arc<AtomicBool>,
     /// What the YouTube screen plays; it keeps playing while this stays the same
     youtube_key: Option<YouTubeKey>,
+    media_cmd: Arc<AtomicU8>,
+    /// The video stopped with Stop (it stays stopped while this file stays chosen)
+    video_stopped: Option<PathBuf>,
     stop: Arc<AtomicBool>,
     jobs: mpsc::Receiver<(Job, JobDone)>,
     on_status: Box<dyn Fn(&Status) + Send>,
@@ -190,9 +229,15 @@ struct Controller {
     /// Current picture rotation (canvas is portrait for 90/270)
     rotation: u16,
     baseline: Option<u16>,
-    key_down: bool,
+    touch: Touch,
     next_poll: Instant,
     anim_frame: u32,
+    /// What plays is paused (holding the touch button)
+    paused: bool,
+    /// The device was just connected: YouTube starts as if it had just been chosen
+    just_connected: bool,
+    /// Status text of the connection ("connected (port, firmware)")
+    connected_text: String,
     meter: Meter,
     /// Software brightness (None = full brightness)
     dimmer: Option<Dimmer>,
@@ -228,7 +273,7 @@ impl Dimmer {
 /// YouTube address, playing, scaling, canvas size
 type YouTubeKey = (Option<String>, bool, crate::scale::Scaling, crate::render::Size);
 
-/// The mode after the current one in the button's cycle: all modes (or the configured
+/// The mode after the current one in the touch button's cycle: all modes (or the configured
 /// list), without Image, GIF and Video while no file is chosen for them.
 fn next_button_mode(cfg: &Config) -> Mode {
     let seq: Vec<Mode> = if cfg.button_modes.is_empty() { Mode::ALL.to_vec() } else { cfg.button_modes.clone() };
@@ -244,12 +289,34 @@ fn next_button_mode(cfg: &Config) -> Mode {
     (0..seq.len()).map(|k| seq[(start + k) % seq.len()]).find(usable).unwrap_or(cfg.mode)
 }
 
-const BUTTON_POLL: Duration = Duration::from_millis(200);
+/// The YouTube address after `current` (after the last one: the first)
+fn youtube_after(entries: &[String], current: Option<&str>) -> Option<String> {
+    let at = current.and_then(|c| entries.iter().position(|e| e == c));
+    let next = at.map_or(0, |i| (i + 1) % entries.len().max(1));
+    entries.get(next).cloned()
+}
 
-/// YouTube starts this long after its mode is chosen (so the device's button can pass it
-/// without starting a stream each time)
-#[cfg_attr(not(feature = "youtube"), allow(dead_code))]
-const YOUTUBE_AUTOPLAY_DELAY: Duration = Duration::from_secs(2);
+/// Often enough to see quick taps and double taps
+const BUTTON_POLL: Duration = Duration::from_millis(100);
+
+/// YouTube mode: a second tap within this time after the first one is a double tap (next
+/// address); a single tap pauses / plays when this time has passed
+const DOUBLE_TAP: Duration = Duration::from_millis(450);
+
+/// Holding the touch button this long switches to the next mode (a shorter tap pauses or
+/// plays)
+const HOLD_TOUCH: Duration = Duration::from_millis(500);
+
+/// State of the touch button
+#[derive(Default)]
+struct Touch {
+    /// Touched since then
+    since: Option<Instant>,
+    /// This touch was held and has switched the mode; letting go then does nothing
+    held: bool,
+    /// YouTube mode: a tap that may become a double tap (when it ended)
+    tap: Option<Instant>,
+}
 
 impl Controller {
     fn set_status(&self, f: impl FnOnce(&mut Status)) {
@@ -319,10 +386,12 @@ impl Controller {
                 d.version.map(|v| v.to_string()).unwrap_or("?".into())
             );
             self.dev = Some(d);
+            self.just_connected = true;
             self.flipped = None;
             self.baseline = None;
             self.shown = None;
             self.changed.store(true, Ordering::SeqCst);
+            self.connected_text = text.clone();
             self.set_status(|s| {
                 s.connected = true;
                 s.text = text;
@@ -339,6 +408,11 @@ impl Controller {
                     anyhow::bail!(e);
                 }
             }
+        }
+        match self.media_cmd.swap(MEDIA_NONE, Ordering::SeqCst) {
+            MEDIA_PLAY_PAUSE => self.toggle_pause(),
+            MEDIA_STOP => self.stop_media(),
+            _ => {}
         }
         if self.changed.swap(false, Ordering::SeqCst) {
             self.enter_mode()?;
@@ -377,14 +451,22 @@ impl Controller {
             self.dimmer = (cfg.brightness < 100).then(|| Dimmer::new(cfg.brightness));
             self.shown = None;
         }
-        // YouTube chosen (coming from another mode): it plays by itself after a moment, also
-        // when it was stopped
-        let youtube_selected = cfg.mode == Mode::YouTube && self.mode != Mode::YouTube;
+        // YouTube chosen (coming from another mode, or the device was just connected with
+        // YouTube chosen): it plays right away, also when it was stopped
+        let fresh = std::mem::take(&mut self.just_connected);
+        let youtube_selected = cfg.mode == Mode::YouTube && (self.mode != Mode::YouTube || fresh);
         if youtube_selected && !cfg.youtube_playing && cfg.youtube_url.is_some() {
             cfg.youtube_playing = true;
             let mut c = self.cfg.lock().unwrap();
             c.youtube_playing = true;
             c.save();
+        }
+        // a stopped video stays stopped while it stays chosen (e.g. when the rotation changes)
+        if self.mode != cfg.mode {
+            self.touch.tap = None; // a tap waiting for a second one belonged to the old mode
+        }
+        if !(self.mode == Mode::Video && cfg.mode == Mode::Video && self.video_stopped == cfg.video) {
+            self.video_stopped = None;
         }
         self.mode = cfg.mode;
         #[cfg_attr(not(feature = "youtube"), allow(unused_variables))]
@@ -394,16 +476,19 @@ impl Controller {
         let youtube_key: YouTubeKey = (cfg.youtube_url.clone(), cfg.youtube_playing, cfg.fit, size);
         let restart = self.youtube_restart.swap(false, Ordering::SeqCst);
         let keep_youtube = self.mode == Mode::YouTube && self.youtube_key.as_ref() == Some(&youtube_key) && !restart;
-        // Play (or a favourite) starts right away
-        #[cfg_attr(not(feature = "youtube"), allow(unused_variables))]
-        let youtube_delay = if youtube_selected && !restart { YOUTUBE_AUTOPLAY_DELAY } else { Duration::ZERO };
         self.youtube_key = None;
+        if !keep_youtube {
+            self.paused = false; // a new screen plays
+        }
         let mode = cfg.mode;
         let keep_title = keep_youtube;
+        let connected_text = self.connected_text.clone();
         self.set_status(|s| {
             s.mode = mode;
             if !keep_title {
+                // what the old screen reported (e.g. a YouTube title) no longer applies
                 s.title = None;
+                s.text = connected_text;
             }
             s.fps = 0.0;
             s.kbps = 0.0;
@@ -426,6 +511,11 @@ impl Controller {
                 }
             }
             #[cfg(feature = "video")]
+            Mode::Video if self.video_stopped.is_some() => {
+                self.set_status(|s| s.text = "Video: stopped".into());
+                self.show(render::message(&["Video", "stopped"], [255, 255, 255], size))?;
+            }
+            #[cfg(feature = "video")]
             Mode::Video => match cfg.video.as_deref().map(|p| {
                 VideoScreen::new(p, cfg.fit, size, Playback { sound: cfg.video_sound, looping: cfg.video_loop })
             }) {
@@ -442,8 +532,9 @@ impl Controller {
                     Some(s) if keep_youtube => Some(s),
                     _ => Some(Box::new(YouTubeScreen::new(
                         cfg.youtube_url.as_deref(),
+                        cfg.youtube_url.as_deref().and_then(|u| cfg.youtube_name(u)),
+                        youtube_after(&cfg.youtube_entries(), cfg.youtube_url.as_deref()),
                         cfg.youtube_playing,
-                        youtube_delay,
                         cfg.fit,
                         size,
                         self.youtube_sound.clone(),
@@ -496,6 +587,13 @@ impl Controller {
                 }
             }
         }
+        let media = match self.mode {
+            Mode::Video if self.screen.is_some() => Media::Playing,
+            Mode::YouTube if keep_youtube => self.status.lock().unwrap().media,
+            Mode::YouTube if cfg.youtube_playing && cfg.youtube_url.is_some() => Media::Playing,
+            _ => Media::Idle,
+        };
+        self.set_status(|s| s.media = media);
         Ok(())
     }
 
@@ -555,6 +653,7 @@ impl Controller {
                     }
                 }
             }
+            Mode::Animation if self.paused => Ok(Duration::from_millis(200)),
             Mode::Animation => {
                 let dev = self.dev.as_mut().unwrap();
                 dev.show_flash_image(FLASH_ANIMATION + self.anim_frame * FRAME_PAGES)?;
@@ -566,7 +665,10 @@ impl Controller {
             Mode::Album => Ok(Duration::from_millis(200)),
             _ => match self.screen.as_mut() {
                 Some(s) => {
-                    let (f, d) = s.render();
+                    let (mut f, d) = s.render();
+                    if self.paused {
+                        render::draw_pause_mark(&mut f, canvas_size(self.rotation));
+                    }
                     if let Some(st) = s.status() {
                         self.set_status(|s| {
                             s.text = st.text;
@@ -581,7 +683,7 @@ impl Controller {
         }
     }
 
-    /// Read the push button. Also the keep-alive: the device returns to offline mode
+    /// Read the touch button: a tap is the next mode, holding it pauses. Also the keep-alive: the device returns to offline mode
     /// after ~5 s without traffic.
     fn poll_button(&mut self) -> anyhow::Result<()> {
         if Instant::now() < self.next_poll {
@@ -596,18 +698,127 @@ impl Controller {
         if !self.use_button {
             return Ok(());
         }
-        if v < base {
-            self.key_down = true;
-        } else if self.key_down {
-            self.key_down = false;
-            let mut cfg = self.cfg.lock().unwrap();
-            let next = next_button_mode(&cfg);
-            cfg.mode = next;
-            cfg.save();
-            drop(cfg);
-            self.changed.store(true, Ordering::SeqCst);
+        let touched = v < base;
+        match (touched, self.touch.since) {
+            (true, None) => {
+                self.touch.since = Some(Instant::now());
+                self.touch.held = false;
+            }
+            (true, Some(since)) => {
+                // held: next mode right away, once per touch
+                if !self.touch.held && since.elapsed() >= HOLD_TOUCH {
+                    self.touch.held = true;
+                    self.touch.tap = None;
+                    self.touch_next();
+                }
+            }
+            (false, Some(_)) => {
+                self.touch.since = None;
+                if !self.touch.held {
+                    if !self.double_tap_counts() {
+                        self.toggle_pause(); // a tap: pause / play
+                    } else if self.touch.tap.take().is_some_and(|t| t.elapsed() <= DOUBLE_TAP) {
+                        self.youtube_next(); // a double tap: next YouTube address
+                    } else {
+                        self.touch.tap = Some(Instant::now()); // wait for a second tap
+                    }
+                }
+            }
+            (false, None) => {
+                // no second tap came: it was a single tap
+                if self.touch.tap.is_some_and(|t| t.elapsed() > DOUBLE_TAP) {
+                    self.touch.tap = None;
+                    self.toggle_pause();
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Holding the touch button: the next mode.
+    fn touch_next(&mut self) {
+        let mut cfg = self.cfg.lock().unwrap();
+        cfg.mode = next_button_mode(&cfg);
+        cfg.save();
+        drop(cfg);
+        self.changed.store(true, Ordering::SeqCst);
+    }
+
+    /// A double tap means something: YouTube mode with more than one address to switch to
+    fn double_tap_counts(&self) -> bool {
+        self.mode == Mode::YouTube && self.cfg.lock().unwrap().youtube_entries().len() > 1
+    }
+
+    /// Double tap in YouTube mode: play the next address (the typed one, then the favourites).
+    fn youtube_next(&mut self) {
+        let mut cfg = self.cfg.lock().unwrap();
+        let entries = cfg.youtube_entries();
+        if let Some(next) = youtube_after(&entries, cfg.youtube_url.as_deref()) {
+            cfg.youtube_url = Some(next);
+            cfg.youtube_playing = true;
+            cfg.save();
+            drop(cfg);
+            self.youtube_restart.store(true, Ordering::SeqCst);
+            self.changed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Video / YouTube: stop.
+    fn stop_media(&mut self) {
+        match self.mode {
+            Mode::Video => {
+                self.video_stopped = self.cfg.lock().unwrap().video.clone();
+                self.changed.store(true, Ordering::SeqCst);
+            }
+            Mode::YouTube => {
+                let mut c = self.cfg.lock().unwrap();
+                c.youtube_playing = false;
+                c.save();
+                self.changed.store(true, Ordering::SeqCst);
+            }
+            _ => {}
+        }
+    }
+
+    /// Pause or continue the video, GIF, YouTube or Slot2 animation that plays. A stopped
+    /// YouTube or video starts, an ended video starts again.
+    fn toggle_pause(&mut self) {
+        let paused = match self.mode {
+            Mode::Animation => Some(!self.paused),
+            Mode::Video if self.video_stopped.is_some() => {
+                self.video_stopped = None;
+                self.changed.store(true, Ordering::SeqCst);
+                return;
+            }
+            _ => self.screen.as_mut().and_then(|s| s.toggle_pause()),
+        };
+        match paused {
+            Some(p) => {
+                self.paused = p;
+                if self.mode != Mode::YouTube {
+                    let text = format!("{}: {}", self.mode.label(), if p { "paused" } else { "playing" });
+                    self.set_status(|s| s.text = text);
+                }
+                if matches!(self.mode, Mode::Video | Mode::YouTube) {
+                    self.set_status(|s| s.media = if p { Media::Paused } else { Media::Playing });
+                }
+            }
+            // ended (without looping): play it again
+            None if self.mode == Mode::Video && self.cfg.lock().unwrap().video.is_some() => {
+                self.changed.store(true, Ordering::SeqCst);
+            }
+            None if self.mode == Mode::YouTube => {
+                let mut c = self.cfg.lock().unwrap();
+                if !c.youtube_playing && c.youtube_url.is_some() {
+                    c.youtube_playing = true;
+                    c.save();
+                    drop(c);
+                    self.youtube_restart.store(true, Ordering::SeqCst);
+                    self.changed.store(true, Ordering::SeqCst);
+                }
+            }
+            None => {}
+        }
     }
 }
 
@@ -616,8 +827,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn double_tap_steps_through_youtube_addresses() {
+        use crate::config::Favorite;
+        let fav = |n: &str| Favorite { name: n.into(), url: format!("https://yt/{n}") };
+        let mut cfg = Config { youtube_favorites: vec![fav("a"), fav("b")], ..Default::default() };
+        cfg.set_youtube_url("https://yt/typed".into());
+        let entries = cfg.youtube_entries();
+        assert_eq!(entries, ["https://yt/typed", "https://yt/a", "https://yt/b"]);
+        assert_eq!(youtube_after(&entries, Some("https://yt/typed")).as_deref(), Some("https://yt/a"));
+        // after the last one: the first again
+        assert_eq!(youtube_after(&entries, Some("https://yt/b")).as_deref(), Some("https://yt/typed"));
+        assert_eq!(youtube_after(&entries, None).as_deref(), Some("https://yt/typed"));
+        assert_eq!(youtube_after(&[], None), None);
+        // a favourite played from the window does not replace the typed address
+        cfg.set_youtube_url("https://yt/a".into());
+        assert_eq!(cfg.youtube_typed.as_deref(), Some("https://yt/typed"));
+    }
+
+    #[test]
     #[cfg(feature = "youtube")]
-    fn button_cycles_all_modes_with_a_file() {
+    fn touch_button_cycles_all_modes_with_a_file() {
         let mut cfg = Config { mode: Mode::Clock, ..Default::default() };
         // no files: Image, GIF and Video are skipped
         assert_eq!(next_button_mode(&cfg), Mode::Album);

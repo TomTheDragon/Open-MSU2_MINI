@@ -4,6 +4,8 @@
 #   ... --autostart                       also start in the background after login
 #   ... --udev                            also install a udev rule (sudo): device access for the
 #                                         logged-in user, no ModemManager probing
+#   ... --plugged                         open the window when the screen is plugged in (installs
+#                                         a udev rule with sudo, and systemd user units)
 #   packaging/linux/install.sh --uninstall
 set -e
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -12,19 +14,26 @@ ICON="$HOME/.local/share/icons/hicolor/scalable/apps/open-msu2-mini.svg"
 DESKTOP="$HOME/.local/share/applications/open-msu2-mini.desktop"
 AUTOSTART="$HOME/.config/autostart/open-msu2-mini.desktop"
 UDEV=/etc/udev/rules.d/70-open-msu2-mini.rules
+UDEV_PLUGGED=/etc/udev/rules.d/71-open-msu2-mini-plugged.rules
+UNITS="$HOME/.config/systemd/user"
 
 SRC="$ROOT/dist/open-msu2-mini-linux-x86_64"
-AUTO=0; RULE=0
+AUTO=0; RULE=0; PLUGGED=0
 for a in "$@"; do
     case "$a" in
         --uninstall)
             pkill -x open-msu2-mini 2>/dev/null || true
-            rm -f "$BIN" "$ICON" "$DESKTOP" "$AUTOSTART"
+            systemctl --user disable open-msu2-mini-plugged.service 2>/dev/null || true
+            rm -f "$BIN" "$ICON" "$DESKTOP" "$AUTOSTART" \
+                "$UNITS/open-msu2-mini-plugged.service" "$UNITS/open-msu2-mini-plugged.target"
+            systemctl --user daemon-reload 2>/dev/null || true
             [ -f "$UDEV" ] && sudo rm -f "$UDEV" && sudo udevadm control --reload
+            [ -f "$UDEV_PLUGGED" ] && sudo rm -f "$UDEV_PLUGGED" && sudo udevadm control --reload
             echo "Removed (settings in ~/.config/open-msu2-mini were kept)."
             exit 0 ;;
         --autostart) AUTO=1 ;;
         --udev) RULE=1 ;;
+        --plugged) PLUGGED=1 ;;
         *) SRC="$a" ;;
     esac
 done
@@ -45,6 +54,15 @@ if [ $RULE = 1 ]; then
     sudo install -m 644 "$ROOT/packaging/linux/70-open-msu2-mini.rules" "$UDEV"
     sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=tty
     echo "udev rule installed."
+fi
+if [ $PLUGGED = 1 ]; then
+    mkdir -p "$UNITS"
+    sed "s#@BIN@#$BIN#" "$ROOT/packaging/linux/open-msu2-mini-plugged.service" > "$UNITS/open-msu2-mini-plugged.service"
+    install -m 644 "$ROOT/packaging/linux/open-msu2-mini-plugged.target" "$UNITS/"
+    sudo install -m 644 "$ROOT/packaging/linux/71-open-msu2-mini-plugged.rules" "$UDEV_PLUGGED"
+    sudo udevadm control --reload
+    systemctl --user daemon-reload && systemctl --user enable open-msu2-mini-plugged.service
+    echo "The window now opens when the screen is plugged in (switch it off in the window)."
 fi
 
 # missing system libraries / ffmpeg (package names: see "Install" in README.md)

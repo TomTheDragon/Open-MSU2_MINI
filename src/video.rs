@@ -100,6 +100,8 @@ pub struct VideoScreen {
     looping: bool,
     /// Start of the current pass (set when its first picture is shown)
     pass_start: Option<Instant>,
+    /// Paused since then
+    paused_at: Option<Instant>,
     /// Next picture, waiting for its time
     pending: Option<(Frame565, Duration, Duration)>,
     last: Option<Frame565>,
@@ -177,6 +179,7 @@ impl VideoScreen {
             sound,
             looping,
             pass_start: None,
+            paused_at: None,
             pending: None,
             last: None,
             last_end: Duration::ZERO,
@@ -205,10 +208,16 @@ impl VideoScreen {
         self.error_text.as_deref()
     }
 
-    /// Playback position in the current pass; None before its first picture.
+    /// Playback position in the current pass; None before its first picture. Stands still
+    /// while paused.
     fn now(&self) -> Option<Duration> {
         let start = self.pass_start?;
-        Some(self.sound.as_ref().and_then(Sound::position).unwrap_or_else(|| start.elapsed()))
+        let clock = || self.paused_at.unwrap_or_else(Instant::now).saturating_duration_since(start);
+        Some(self.sound.as_ref().and_then(Sound::position).unwrap_or_else(clock))
+    }
+
+    pub fn paused(&self) -> bool {
+        self.paused_at.is_some()
     }
 
     fn fail(&mut self, e: &str) -> (Frame565, Duration) {
@@ -222,9 +231,38 @@ impl VideoScreen {
 }
 
 impl Screen for VideoScreen {
+    fn toggle_pause(&mut self) -> Option<bool> {
+        if self.error.is_some() || self.finished() {
+            return None;
+        }
+        match self.paused_at.take() {
+            Some(at) => {
+                // leave the pause out of the clock
+                if let Some(start) = self.pass_start.as_mut() {
+                    *start += at.elapsed();
+                }
+                if let Some(s) = &self.sound {
+                    s.set_paused(false);
+                }
+            }
+            None => {
+                self.paused_at = Some(Instant::now());
+                if let Some(s) = &self.sound {
+                    s.set_paused(true);
+                }
+            }
+        }
+        Some(self.paused())
+    }
+
     fn render(&mut self) -> (Frame565, Duration) {
         if let Some(e) = &self.error {
             return (e.clone(), Duration::from_millis(500));
+        }
+        if self.paused() {
+            // the decoder waits too: it can only work a few pictures ahead
+            let f = self.last.clone().unwrap_or_else(|| vec![0; self.size.0 * self.size.1]);
+            return (f, Duration::from_millis(50));
         }
         let mut fresh = None;
         let mut wait = Duration::from_millis(5);
@@ -466,6 +504,18 @@ pub(crate) fn find_ffmpeg() -> Option<PathBuf> {
 /// Finds a helper program: next to this program, where winget (Windows) or Homebrew (macOS)
 /// put it, or in PATH. `args` is a quick command that must succeed.
 pub(crate) fn find_tool(tool: &str, args: &[&str]) -> Option<PathBuf> {
+    // found once, kept for the rest of the run (starting yt-dlp just to check takes ~0.3 s);
+    // a missing one is searched again, so installing it later works without a restart
+    static FOUND: std::sync::Mutex<Vec<(String, PathBuf)>> = std::sync::Mutex::new(Vec::new());
+    if let Some((_, p)) = FOUND.lock().unwrap().iter().find(|(t, _)| t == tool) {
+        return Some(p.clone());
+    }
+    let found = search_tool(tool, args)?;
+    FOUND.lock().unwrap().push((tool.to_string(), found.clone()));
+    Some(found)
+}
+
+fn search_tool(tool: &str, args: &[&str]) -> Option<PathBuf> {
     let name = if cfg!(windows) { format!("{tool}.exe") } else { tool.to_string() };
     let beside = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join(&name)));
     // Windows: where "winget install ..." links it (in PATH only for programs

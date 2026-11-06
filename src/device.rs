@@ -15,7 +15,7 @@ pub const USB_PID: u16 = 0xFE0C;
 
 /// Flash layout used by the stock firmware (1 page = 256 bytes).
 pub const FLASH_ANIMATION: u32 = 0; // 36 frames x 100 pages, played when no PC is connected
-/// Still picture the device shows by itself while no PC is connected; its button switches
+/// Still picture the device shows by itself while no PC is connected; its touch button switches
 /// between this and the animation (the vendor demo used this page as clock background).
 pub const FLASH_IMAGE: u32 = 3826;
 // Page 3926 is the vendor demo's "album" picture; the firmware never shows it by itself.
@@ -453,7 +453,7 @@ impl Device {
         let _ = self.read_available();
     }
 
-    /// Read an ADC channel. Channel 9 is the push button. Doubles as keep-alive: the
+    /// Read an ADC channel. Channel 9 is the touch button. Doubles as keep-alive: the
     /// device drops back to offline mode after ~5 s without traffic.
     pub fn read_adc(&mut self, ch: u8) -> Result<u16> {
         self.cmd([8, ch, 0, 0, 0, 0]);

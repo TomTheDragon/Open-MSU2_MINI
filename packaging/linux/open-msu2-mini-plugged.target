@@ -1,0 +1,5 @@
+# Active while an MSU2 / MSU2_MINI screen is plugged in (see 71-open-msu2-mini-plugged.rules).
+# It stops when the screen is unplugged, so the next plug-in starts it again.
+[Unit]
+Description=MSU2 / MSU2_MINI screen plugged in
+StopWhenUnneeded=yes

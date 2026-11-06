@@ -10,6 +10,8 @@ mkdir -p "$STAGE" dist
 # fixed paths, as used in packaging/linux/nfpm.yaml
 cp "$BINARY" "$STAGE/open-msu2-mini"
 sed 's#@BIN@#/usr/bin/open-msu2-mini#' packaging/linux/open-msu2-mini.desktop > "$STAGE/open-msu2-mini.desktop"
+sed 's#@BIN@#/usr/bin/open-msu2-mini#' packaging/linux/open-msu2-mini-plugged.service \
+    > "$STAGE/open-msu2-mini-plugged.service"
 for p in deb rpm archlinux; do
     docker run --rm -u "$(id -u):$(id -g)" -v "$PWD":/src -w /src \
         -e VERSION="$VERSION" \

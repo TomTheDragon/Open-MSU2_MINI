@@ -24,7 +24,9 @@ fn available(shown: &[StatEntry]) -> Vec<StatItem> {
 
 /// Show the dialog; returns the new settings, or None when cancelled.
 pub fn customize(parent: &dyn WxWidget, current: &StatsConfig) -> Option<StatsConfig> {
-    let dlg = Dialog::builder(parent, "System monitor").build();
+    let dlg = Dialog::builder(parent, "System monitor")
+        .with_style(DialogStyle::DefaultDialogStyle | DialogStyle::ResizeBorder)
+        .build();
     let root = BoxSizer::builder(Orientation::Vertical).build();
     let pad = 8;
 
@@ -38,7 +40,9 @@ pub fn customize(parent: &dyn WxWidget, current: &StatsConfig) -> Option<StatsCo
 
     let shown = Rc::new(RefCell::new(current.items.clone()));
     let lists = BoxSizer::builder(Orientation::Horizontal).build();
-    let list_size = Size::new(220, 300);
+    // room for about 14 rows (GTK rows are a little taller than the text), wider for
+    // disk rows with a drive
+    let list_size = crate::gui::list_size(&dlg, 300, 14);
     let shown_list = ListBox::builder(&ib).with_size(list_size).build();
     let avail_list = ListBox::builder(&ib).with_size(list_size).build();
 
@@ -46,11 +50,13 @@ pub fn customize(parent: &dyn WxWidget, current: &StatsConfig) -> Option<StatsCo
     let mut drives: Vec<(DiskSelect, String)> =
         vec![(DiskSelect::System, "System drive".to_string()), (DiskSelect::All, "All drives together".to_string())];
     drives.extend(crate::stats::drive_choices().into_iter().map(|(m, d)| (DiskSelect::Mount(m), d)));
-    // keep chosen drives that are not connected right now
+    // keep chosen drives that are not listed: not connected right now, or listed under
+    // another mount point of the same partition
     for e in &current.items {
         if let DiskSelect::Mount(m) = &e.drive {
             if !drives.iter().any(|(s, _)| *s == e.drive) {
-                drives.push((e.drive.clone(), format!("{m}   (not found)")));
+                let note = if crate::stats::is_mounted(m) { "" } else { "   (not found)" };
+                drives.push((e.drive.clone(), format!("{m}{note}")));
             }
         }
     }

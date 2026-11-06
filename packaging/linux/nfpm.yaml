@@ -24,6 +24,13 @@ contents:
     dst: /usr/share/icons/hicolor/scalable/apps/open-msu2-mini.svg
   - src: packaging/linux/70-open-msu2-mini.rules
     dst: /usr/lib/udev/rules.d/70-open-msu2-mini.rules
+  # optional: open the window when the screen is plugged in (off until switched on per user)
+  - src: packaging/linux/71-open-msu2-mini-plugged.rules
+    dst: /usr/lib/udev/rules.d/71-open-msu2-mini-plugged.rules
+  - src: packaging/linux/open-msu2-mini-plugged.target
+    dst: /usr/lib/systemd/user/open-msu2-mini-plugged.target
+  - src: target/package/open-msu2-mini-plugged.service
+    dst: /usr/lib/systemd/user/open-msu2-mini-plugged.service
   - src: LICENSE
     dst: /usr/share/licenses/open-msu2-mini/LICENSE
   - src: README.md

@@ -23,6 +23,126 @@ fn file_name(p: &Option<PathBuf>) -> String {
     p.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "none".into())
 }
 
+const TOUCH_HELP: &str = "The touch button on the device:\n\
+     tap: pause or play the video, GIF, YouTube or Slot2 animation\n\
+     double tap (YouTube mode): next address (the typed one, then the favourites)\n\
+     hold for half a second: next mode (of the ones chosen here; Image, GIF, Video and YouTube once a\n\
+     file or address is set)";
+
+/// The user service that opens the window when the screen is plugged in
+#[cfg(target_os = "linux")]
+const PLUGGED_SERVICE: &str = "open-msu2-mini-plugged.service";
+
+/// Whether the window opens when the screen is plugged in; None when that is not installed.
+#[cfg(target_os = "linux")]
+fn plugged_service_state() -> Option<bool> {
+    let out = std::process::Command::new("systemctl").args(["--user", "is-enabled", PLUGGED_SERVICE]).output().ok()?;
+    match String::from_utf8_lossy(&out.stdout).trim() {
+        "enabled" | "enabled-runtime" | "linked" => Some(true),
+        "disabled" => Some(false),
+        _ => None, // not found, or no systemd
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn set_plugged_service(on: bool) -> Result<()> {
+    let out = std::process::Command::new("systemctl")
+        .args(["--user", if on { "enable" } else { "disable" }, PLUGGED_SERVICE])
+        .output()?;
+    if !out.status.success() {
+        anyhow::bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(())
+}
+
+/// Label of a Play / Pause button
+#[cfg_attr(not(feature = "video"), allow(dead_code))]
+pub fn play_label(playing: bool) -> &'static str {
+    if playing {
+        "❚❚ Pause"
+    } else {
+        "▶ Play"
+    }
+}
+
+/// Keeps a page up to date with what plays (called by the window's timer)
+pub type Refresh = Rc<dyn Fn(&controller::Status, &Config)>;
+
+/// Size of a list box that shows about `rows` entries at once.
+pub fn list_size(parent: &dyn WxWidget, width: i32, rows: usize) -> Size {
+    let row = parent.get_char_height().max(12) + 10;
+    Size::new(width, row * rows as i32 + 8)
+}
+
+/// "all modes" or the chosen ones
+fn touch_modes_summary(modes: &[Mode]) -> String {
+    let chosen: Vec<&str> = Mode::ALL.iter().filter(|m| modes.contains(m)).map(|m| m.label()).collect();
+    if modes.is_empty() || chosen.len() == Mode::ALL.len() {
+        "all modes".into()
+    } else {
+        let mut s = chosen.join(", ");
+        if s.chars().count() > 60 {
+            s = format!("{} modes", chosen.len());
+        }
+        s
+    }
+}
+
+/// Dialog: which modes the touch button cycles through. Empty = all.
+fn choose_touch_modes(parent: &Frame, current: &[Mode]) -> Option<Vec<Mode>> {
+    let dlg = Dialog::builder(parent, "Touch button").build();
+    let root = BoxSizer::builder(Orientation::Vertical).build();
+    let hint = StaticText::builder(&dlg)
+        .with_label("Holding the touch button on the device for half a second switches between these modes:")
+        .build();
+    root.add(&hint, 0, SizerFlag::All, 8);
+    let list = CheckListBox::builder(&dlg).with_size(list_size(&dlg, 340, Mode::ALL.len() + 1)).build();
+    for (i, m) in Mode::ALL.iter().enumerate() {
+        list.append(m.label());
+        list.check(i as u32, current.is_empty() || current.contains(m));
+    }
+    root.add(&list, 1, SizerFlag::Expand | SizerFlag::Left | SizerFlag::Right, 8);
+    let note = StaticText::builder(&dlg)
+        .with_label(
+            "Image, GIF, Video and YouTube are skipped until a file or address is chosen.\n\
+                     A short tap pauses or plays videos, GIFs and YouTube; in YouTube mode\n\
+                     a double tap plays the next address (the typed one, then the favourites).",
+        )
+        .build();
+    note.set_foreground_color(Colour::new(128, 128, 128, 255));
+    root.add(&note, 0, SizerFlag::All, 8);
+    let buttons = BoxSizer::builder(Orientation::Horizontal).build();
+    let all = Button::builder(&dlg).with_label("All").build();
+    let cancel = Button::builder(&dlg).with_id(ID_CANCEL).with_label("Cancel").build();
+    let ok = Button::builder(&dlg).with_id(ID_OK).with_label("OK").build();
+    all.on_click(move |_| {
+        for i in 0..list.get_count() {
+            list.check(i, true);
+        }
+    });
+    buttons.add(&all, 0, SizerFlag::Right, 0);
+    buttons.add_stretch_spacer(1);
+    buttons.add(&cancel, 0, SizerFlag::Right, 6);
+    buttons.add(&ok, 0, SizerFlag::Right, 0);
+    root.add_sizer(&buttons, 0, SizerFlag::Expand | SizerFlag::All, 8);
+    dlg.set_sizer_and_fit(root, true);
+    dlg.centre();
+    if dlg.show_modal() != ID_OK {
+        return None;
+    }
+    let chosen: Vec<Mode> =
+        Mode::ALL.iter().enumerate().filter(|(i, _)| list.is_checked(*i as u32)).map(|(_, m)| *m).collect();
+    if chosen.is_empty() {
+        MessageDialog::builder(parent, "Choose at least one mode for the touch button.", "Open MSU2_MINI")
+            .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconWarning)
+            .build()
+            .show_modal();
+        return None;
+    }
+    // all chosen: saved as "all", so modes added in later versions are included
+    Some(if chosen.len() == Mode::ALL.len() { Vec::new() } else { chosen })
+}
+
 /// (port, USB serial number) of a device in the device list; (None, None) = the first one found
 type DeviceChoice = (Option<String>, Option<String>);
 
@@ -50,11 +170,13 @@ pub fn run(port: Option<String>) -> Result<()> {
         cfg.device_serial = None;
     }
 
+    config::set_gui_pid(true);
     let result = wxdragon::main(move |_| {
         // Follow the system light/dark setting (needed on Windows, automatic elsewhere).
         let _ = set_appearance(Appearance::System);
         build(cfg, resume_background);
     });
+    config::set_gui_pid(false);
     result.map_err(|e| anyhow::anyhow!("{e}"))
 }
 
@@ -189,6 +311,9 @@ fn build(cfg: Config, resume_background: bool) {
         p
     };
     let mut pages: Vec<(Mode, Panel)> = Vec::new();
+    // pages that follow what plays (Play / Pause buttons, the YouTube address)
+    #[cfg_attr(not(feature = "video"), allow(unused_mut))]
+    let mut refreshers: Vec<Refresh> = Vec::new();
 
     // screen mirror
     {
@@ -400,6 +525,37 @@ fn build(cfg: Config, resume_background: bool) {
         grid.add(&video_name, 0, cv, 0);
         grid.add(&video_btn, 0, cv, 0);
 
+        // play / pause and stop
+        let play = Button::builder(&bx).with_label(play_label(false)).build();
+        play.set_tooltip("Pause and go on, or play the video again (like a tap on the device's touch button).");
+        let stop = Button::builder(&bx).with_label("■ Stop").build();
+        stop.set_tooltip("Stop the video. Play starts it from the beginning.");
+        {
+            let h = handle.clone();
+            play.on_click(move |_| {
+                let mode = h.borrow().cfg.lock().unwrap().mode;
+                if mode == Mode::Video {
+                    h.borrow().play_pause();
+                } else {
+                    h.borrow().update(|c| c.mode = Mode::Video);
+                }
+            });
+            let h = handle.clone();
+            stop.on_click(move |_| h.borrow().stop_media());
+        }
+        let controls = BoxSizer::builder(Orientation::Horizontal).build();
+        controls.add(&play, 0, cv, 0);
+        controls.add(&stop, 0, cv | SizerFlag::Left, 4);
+        grid.add(&label(&bx, ""), 0, cv, 0);
+        grid.add_sizer(&controls, 0, cv, 0);
+        grid.add(&label(&bx, ""), 0, cv, 0);
+        refreshers.push(Rc::new(move |s: &controller::Status, _: &Config| {
+            let l = play_label(s.mode == Mode::Video && s.media == controller::Media::Playing);
+            if play.get_label() != l {
+                play.set_label(l);
+            }
+        }));
+
         let video_sound = CheckBox::builder(&bx).with_label("Sound").build();
         video_sound.set_value(cfg.video_sound);
         video_sound.set_tooltip("Play the video's sound on the computer's default sound output.");
@@ -433,7 +589,8 @@ fn build(cfg: Config, resume_background: bool) {
     #[cfg(feature = "youtube")]
     {
         let p = Panel::builder(&book).build();
-        let sb = crate::gui_youtube::build(&p, frame, &handle, &cfg);
+        let (sb, refresh) = crate::gui_youtube::build(&p, frame, &handle, &cfg);
+        refreshers.push(refresh);
         pages.push((Mode::YouTube, finish_page(p, sb, None)));
     }
 
@@ -455,7 +612,7 @@ fn build(cfg: Config, resume_background: bool) {
         btn.set_tooltip(tip);
         let note = grey(label(
             &bx,
-            "Stays on the device without PC: it shows Slot2, its button switches to Slot1.\n\
+            "Stays on the device without PC: it shows Slot2, its touch button switches to Slot1.\n\
              Brightness does not affect it; it is turned by the rotation set when uploading.",
         ));
         let gauge = Gauge::builder(&bx).with_range(100).build();
@@ -557,6 +714,61 @@ fn build(cfg: Config, resume_background: bool) {
     grid.add(&tray_choice, 0, cv, 0);
     grid.add(&start_min, 0, cv, 0);
 
+    // modes the touch button cycles through
+    let touch_summary = label(&op, &touch_modes_summary(&cfg.button_modes));
+    let touch_btn = Button::builder(&op).with_label("Choose modes...").build();
+    touch_btn.set_tooltip(TOUCH_HELP);
+    touch_summary.set_tooltip(TOUCH_HELP);
+    {
+        let (h, f, summary) = (handle.clone(), frame, touch_summary);
+        touch_btn.on_click(move |_| {
+            let current = h.borrow().cfg.lock().unwrap().button_modes.clone();
+            if let Some(modes) = choose_touch_modes(&f, &current) {
+                summary.set_label(&touch_modes_summary(&modes));
+                h.borrow().update(|c| c.button_modes = modes);
+            }
+        });
+    }
+    grid.add(&label(&op, "Touch button (hold):"), 0, cv, 0);
+    grid.add(&touch_summary, 0, cv, 0);
+    grid.add(&touch_btn, 0, cv, 0);
+
+    // Linux: open this window when the screen is plugged in (systemd user service)
+    #[cfg(target_os = "linux")]
+    {
+        let plugged = CheckBox::builder(&op).with_label("Open this window when the screen is plugged in").build();
+        match plugged_service_state() {
+            Some(on) => {
+                plugged.set_value(on);
+                plugged.set_tooltip(
+                    "Opens this window when the MSU2 screen is plugged in (also at login, when it is\n\
+                     plugged in then). Nothing happens when the window or the background mode already runs.",
+                );
+            }
+            None => {
+                plugged.enable(false);
+                plugged.set_tooltip(
+                    "Needs the Linux package (deb, rpm, Arch), or install.sh --plugged.\n\
+                     Not available for the AppImage and the single executable.",
+                );
+            }
+        }
+        let f = frame;
+        plugged.on_toggled(move |_| {
+            let on = plugged.get_value();
+            if let Err(e) = set_plugged_service(on) {
+                plugged.set_value(!on);
+                MessageDialog::builder(&f, &format!("Could not change it: {e}"), "Open MSU2_MINI")
+                    .with_style(MessageDialogStyle::OK | MessageDialogStyle::IconError)
+                    .build()
+                    .show_modal();
+            }
+        });
+        grid.add(&label(&op, "Screen plugged in:"), 0, cv, 0);
+        grid.add(&plugged, 0, cv, 0);
+        grid.add(&label(&op, ""), 0, cv, 0);
+    }
+
     opt_box.add_sizer(&grid, 0, SizerFlag::Expand | SizerFlag::All, 6);
     root.add_sizer(&opt_box, 0, SizerFlag::Expand | SizerFlag::Left | SizerFlag::Right | SizerFlag::Top, pad);
 
@@ -600,7 +812,10 @@ fn build(cfg: Config, resume_background: bool) {
         btn.on_click(move |_| s(animation));
     }
 
-    let tip = StaticText::builder(&panel).with_label("Tip: the button on the device cycles through the modes.").build();
+    let tip = StaticText::builder(&panel)
+        .with_label("Tip: tap the touch button on the device to pause or play, hold it for the next mode.")
+        .build();
+    tip.set_tooltip(TOUCH_HELP);
     let version = StaticText::builder(&panel).with_label(concat!("Version ", env!("CARGO_PKG_VERSION"))).build();
     version.set_tooltip(crate::APP_TITLE);
     let bottom = BoxSizer::builder(Orientation::Horizontal).build();
@@ -658,7 +873,7 @@ fn build(cfg: Config, resume_background: bool) {
         });
     }
 
-    // -- periodic UI refresh (status, button-driven mode changes, flash progress) -------
+    // -- periodic UI refresh (status, mode changes by the touch button, flash progress) -------
     let timer = Rc::new(Timer::new(&frame));
     {
         let (h, st, f) = (handle.clone(), flash_state.clone(), frame);
@@ -677,6 +892,12 @@ fn build(cfg: Config, resume_background: bool) {
                 f.hide();
             }
             let s = h.borrow().status.lock().unwrap().clone();
+            if !refreshers.is_empty() {
+                let c = h.borrow().cfg.lock().unwrap().clone();
+                for r in &refreshers {
+                    r(&s, &c);
+                }
+            }
             if *last_text.borrow() != s.text {
                 status.set_label(&s.text);
                 *last_text.borrow_mut() = s.text.clone();

@@ -43,6 +43,8 @@ struct State {
     queue: VecDeque<f32>,
     /// Output takes from the queue (the clock runs)
     playing: bool,
+    /// Paused: when, and the position then (the clock stands still)
+    paused: Option<(Instant, Duration)>,
     /// Frames handed to the device since `play`
     played: u64,
     /// Time of the last output callback and how many frames it took from the queue
@@ -90,31 +92,55 @@ impl Sound {
         st.generation += 1;
         st.queue.clear();
         st.playing = false;
+        st.paused = None;
         st.played = 0;
         st.last_callback = None;
         st.input_done = false;
         st.drained_at = None;
     }
 
+    /// Pause (silent, the clock stands still) or go on.
+    pub fn set_paused(&self, pause: bool) {
+        let mut st = self.shared.state.lock().unwrap();
+        if pause && st.paused.is_none() {
+            let pos = position(&st).unwrap_or_default();
+            st.paused = Some((Instant::now(), pos));
+        } else if !pause {
+            if let Some((at, _)) = st.paused.take() {
+                // after the end the clock runs on its own: leave out the pause
+                if let Some(d) = st.drained_at.as_mut() {
+                    *d += at.elapsed();
+                }
+            }
+        }
+    }
+
     /// How far the sound has played since `play`. None when there is no sound.
     pub fn position(&self) -> Option<Duration> {
-        let st = self.shared.state.lock().unwrap();
-        if st.failed {
-            return None;
-        }
-        if !st.playing || st.rate == 0 {
-            return Some(Duration::ZERO);
-        }
-        let rate = st.rate as f64;
-        let secs = |frames: u64| Duration::from_secs_f64(frames as f64 / rate);
-        let pos = match (st.drained_at, st.last_callback) {
-            (Some(at), _) => secs(st.played) + at.elapsed(),
-            // between callbacks, move on smoothly within what the last one handed over
-            (None, Some((at, n))) => secs(st.played - n) + at.elapsed().min(secs(n)),
-            (None, None) => Duration::ZERO,
-        };
-        Some(pos.saturating_sub(st.latency))
+        position(&self.shared.state.lock().unwrap())
     }
+}
+
+/// See `Sound::position`.
+fn position(st: &State) -> Option<Duration> {
+    if st.failed {
+        return None;
+    }
+    if let Some((_, pos)) = st.paused {
+        return Some(pos);
+    }
+    if !st.playing || st.rate == 0 {
+        return Some(Duration::ZERO);
+    }
+    let rate = st.rate as f64;
+    let secs = |frames: u64| Duration::from_secs_f64(frames as f64 / rate);
+    let pos = match (st.drained_at, st.last_callback) {
+        (Some(at), _) => secs(st.played) + at.elapsed(),
+        // between callbacks, move on smoothly within what the last one handed over
+        (None, Some((at, n))) => secs(st.played - n) + at.elapsed().min(secs(n)),
+        (None, None) => Duration::ZERO,
+    };
+    Some(pos.saturating_sub(st.latency))
 }
 
 impl Drop for Sound {
@@ -239,7 +265,7 @@ fn build<T: SizedSample + FromSample<f32>>(
         st.latency = ts.playback.duration_since(ts.callback).min(Duration::from_millis(500));
         let mut taken = 0u64;
         for frame in data.chunks_mut(channels) {
-            let (l, r) = if st.playing && st.queue.len() >= 2 {
+            let (l, r) = if st.playing && st.paused.is_none() && st.queue.len() >= 2 {
                 taken += 1;
                 (st.queue.pop_front().unwrap() * volume, st.queue.pop_front().unwrap() * volume)
             } else {

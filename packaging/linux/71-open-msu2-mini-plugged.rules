@@ -1,0 +1,6 @@
+# Optional: open the Open MSU2_MINI window when the MSU2 / MSU2_MINI screen is plugged in.
+# udev cannot open windows itself: it starts the user target open-msu2-mini-plugged.target,
+# which does nothing until the user switches it on, in the window ("Open this window when
+# the screen is plugged in") or with
+#   systemctl --user enable open-msu2-mini-plugged.service
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="fe0c", TAG+="systemd", ENV{SYSTEMD_USER_WANTS}+="open-msu2-mini-plugged.target"

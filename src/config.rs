@@ -59,7 +59,7 @@ impl Mode {
 #[serde(default)]
 pub struct Config {
     pub mode: Mode,
-    /// Modes the device's button cycles through; empty = all
+    /// Modes holding the device's touch button cycles through; empty = all
     pub button_modes: Vec<Mode>,
     /// Picture rotation: 0, 90, 180 or 270 degrees (clockwise)
     pub rotation: u16,
@@ -93,6 +93,9 @@ pub struct Config {
     pub youtube_sound: bool,
     /// YouTube mode: saved streams and videos
     pub youtube_favorites: Vec<Favorite>,
+    /// The last address played that is not a favourite (the touch button steps through it
+    /// and the favourites)
+    pub youtube_typed: Option<String>,
     /// Serial port of the chosen device; None = the first one found
     pub port: Option<String>,
     /// USB serial number of the chosen device, if it has one (the port name can change)
@@ -127,6 +130,7 @@ impl Default for Config {
             youtube_playing: true,
             youtube_sound: false,
             youtube_favorites: Vec::new(),
+            youtube_typed: None,
             port: None,
             device_serial: None,
             stats: StatsConfig::default(),
@@ -554,6 +558,12 @@ impl Config {
         c.max_fps = c.max_fps.clamp(0.1, 1000.0);
         c.stats.migrate();
         c.brightness = c.brightness.clamp(MIN_BRIGHTNESS, 100);
+        // older settings kept only the address playing
+        if c.youtube_typed.is_none() {
+            if let Some(u) = c.youtube_url.clone() {
+                c.set_youtube_url(u);
+            }
+        }
         // a mode this build does not have (settings from a build with more features)
         if !c.mode.available() {
             c.mode = Mode::default();
@@ -573,6 +583,31 @@ impl Config {
         c
     }
 
+    /// Play this YouTube address next; one that is not a favourite is kept as the typed one.
+    pub fn set_youtube_url(&mut self, url: String) {
+        if !self.youtube_favorites.iter().any(|f| f.url == url) {
+            self.youtube_typed = Some(url.clone());
+        }
+        self.youtube_url = Some(url);
+    }
+
+    /// The YouTube addresses the touch button steps through: the typed one, then the favourites
+    pub fn youtube_entries(&self) -> Vec<String> {
+        let mut list: Vec<String> = self.youtube_typed.iter().cloned().collect();
+        for f in &self.youtube_favorites {
+            if !list.contains(&f.url) {
+                list.push(f.url.clone());
+            }
+        }
+        list
+    }
+
+    /// Name of a favourite address
+    #[cfg_attr(not(feature = "youtube"), allow(dead_code))]
+    pub fn youtube_name(&self, url: &str) -> Option<String> {
+        self.youtube_favorites.iter().find(|f| f.url == url).map(|f| f.name.clone())
+    }
+
     pub fn save(&self) {
         let _ = std::fs::create_dir_all(config_dir());
         if let Ok(s) = serde_json::to_string_pretty(self) {
@@ -589,7 +624,31 @@ fn pid_file() -> PathBuf {
 
 /// PID of a running `open-msu2-mini run` instance, if any.
 pub fn background_pid() -> Option<u32> {
-    let pid: u32 = std::fs::read_to_string(pid_file()).ok()?.trim().parse().ok()?;
+    running_pid(&pid_file())
+}
+
+fn gui_pid_file() -> PathBuf {
+    config_dir().join("window.pid")
+}
+
+/// PID of an open control window, if any.
+pub fn gui_pid() -> Option<u32> {
+    running_pid(&gui_pid_file()).filter(|p| *p != std::process::id())
+}
+
+/// Note that the control window is open (or closed again).
+pub fn set_gui_pid(open: bool) {
+    let _ = std::fs::create_dir_all(config_dir());
+    if open {
+        let _ = std::fs::write(gui_pid_file(), std::process::id().to_string());
+    } else if running_pid(&gui_pid_file()) == Some(std::process::id()) {
+        let _ = std::fs::remove_file(gui_pid_file());
+    }
+}
+
+/// The program's PID in this file, if it still runs.
+fn running_pid(file: &std::path::Path) -> Option<u32> {
+    let pid: u32 = std::fs::read_to_string(file).ok()?.trim().parse().ok()?;
     let mut sys = sysinfo::System::new().ok()?;
     let p = sysinfo::Pid::from_u32(pid);
     sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[p]), true);

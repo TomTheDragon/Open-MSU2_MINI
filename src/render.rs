@@ -125,6 +125,32 @@ pub trait Screen: Send {
     fn status(&mut self) -> Option<ScreenStatus> {
         None
     }
+    /// Pause or go on (holding the touch button). Returns whether it is paused now, or
+    /// None when there is nothing to pause (a still picture).
+    fn toggle_pause(&mut self) -> Option<bool> {
+        None
+    }
+}
+
+/// Pause sign in the top left corner: two white bars with a dark outline.
+pub fn draw_pause_mark(canvas: &mut [u16], size: Size) {
+    let (w, h) = size;
+    let (x0, y0, bar_w, bar_h, gap) = (3usize, 3usize, 4usize, 12usize, 3usize);
+    let white = crate::device::rgb565(255, 255, 255);
+    let dark = crate::device::rgb565(20, 20, 20);
+    for bar in 0..2 {
+        let bx = x0 + bar * (bar_w + gap);
+        // outline one pixel around the bar, then the bar
+        for (pad, colour) in [(1usize, dark), (0, white)] {
+            for y in (y0 - pad)..(y0 + bar_h + pad) {
+                for x in (bx - pad)..(bx + bar_w + pad) {
+                    if x < w && y < h {
+                        canvas[y * w + x] = colour;
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub struct ScreenStatus {
@@ -186,6 +212,7 @@ impl Screen for ClockScreen {
 pub struct ImageScreen {
     frames: Vec<(Frame565, Duration)>,
     i: usize,
+    paused: bool,
 }
 
 /// Load a picture or an animation (GIF / WebP / PNG) as canvas-sized frames.
@@ -226,15 +253,27 @@ pub fn load_frames(path: &Path, fit: Scaling, size: Size) -> Result<Vec<(Frame56
 
 impl ImageScreen {
     pub fn new(path: &Path, fit: Scaling, size: Size) -> Result<Self> {
-        Ok(ImageScreen { frames: load_frames(path, fit, size)?, i: 0 })
+        Ok(ImageScreen { frames: load_frames(path, fit, size)?, i: 0, paused: false })
     }
 }
 
 impl Screen for ImageScreen {
     fn render(&mut self) -> (Frame565, Duration) {
+        if self.paused {
+            // the picture shown last stays
+            let last = (self.i + self.frames.len() - 1) % self.frames.len();
+            return (self.frames[last].0.clone(), Duration::from_millis(100));
+        }
         let (f, d) = self.frames[self.i].clone();
         self.i = (self.i + 1) % self.frames.len();
         (f, d)
+    }
+    fn toggle_pause(&mut self) -> Option<bool> {
+        if self.frames.len() < 2 {
+            return None; // a still picture
+        }
+        self.paused = !self.paused;
+        Some(self.paused)
     }
 }
 
@@ -278,4 +317,28 @@ pub fn test_pattern() -> Frame565 {
     text(&mut img, "MSU2 test ↑ top", 80, 70, Style::new(11.0, bold(), [255, 255, 0]).anchor(Anchor::Center));
     draw_hollow_rect_mut(&mut img, Rect::at(0, 0).of_size(WIDTH as u32, HEIGHT as u32), Rgb([255, 0, 255]));
     rgb_to_565(&img)
+}
+
+#[cfg(test)]
+mod pause_tests {
+    use super::*;
+
+    #[test]
+    fn paused_gif_keeps_its_picture() {
+        let frame = |v: u16| (vec![v; 16], Duration::from_millis(40));
+        let mut gif = ImageScreen { frames: vec![frame(1), frame(2), frame(3)], i: 0, paused: false };
+        assert_eq!(gif.render().0[0], 1);
+        assert_eq!(gif.toggle_pause(), Some(true));
+        assert_eq!(gif.render().0[0], 1, "the picture shown last stays");
+        assert_eq!(gif.render().0[0], 1);
+        assert_eq!(gif.toggle_pause(), Some(false));
+        assert_eq!(gif.render().0[0], 2, "goes on with the next picture");
+
+        let mut still = ImageScreen { frames: vec![frame(7)], i: 0, paused: false };
+        assert_eq!(still.toggle_pause(), None, "a still picture has nothing to pause");
+
+        let mut canvas = vec![0u16; 160 * 80];
+        draw_pause_mark(&mut canvas, (160, 80));
+        assert_eq!(canvas[4 * 160 + 4], crate::device::rgb565(255, 255, 255));
+    }
 }

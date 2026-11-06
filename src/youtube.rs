@@ -14,8 +14,8 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// How to install yt-dlp, for error messages
 pub const INSTALL_YTDLP: &str = if cfg!(windows) {
@@ -39,6 +39,7 @@ const RESOLVE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_RETRIES: u32 = 5;
 
 /// What yt-dlp found
+#[derive(Clone)]
 struct Stream {
     title: String,
     live: bool,
@@ -83,6 +84,95 @@ impl Format {
 
 fn find_ytdlp() -> Option<PathBuf> {
     video::find_tool("yt-dlp", &["--version"])
+}
+
+/// yt-dlp's answers, so an address played again (or looked up in advance) starts without
+/// asking yt-dlp: (address, answer, usable until), and the addresses being looked up now
+struct Answers {
+    ready: Vec<(String, Stream, SystemTime)>,
+    pending: Vec<String>,
+}
+
+static ANSWERS: Mutex<Answers> = Mutex::new(Answers { ready: Vec::new(), pending: Vec::new() });
+
+/// YouTube's stream addresses carry their expiry time (usually ~6 h); answers are used until
+/// this long before it
+const EXPIRY_MARGIN: Duration = Duration::from_secs(15 * 60);
+/// Longest time an answer is used
+const KEEP_MAX: Duration = Duration::from_secs(5 * 3600);
+/// For addresses without an expiry time (other sites)
+const KEEP_UNKNOWN: Duration = Duration::from_secs(20 * 60);
+
+/// Expiry time in an address: `expire=1762…` or `/expire/1762…/` (live stream playlists)
+fn expiry(url: &str) -> Option<SystemTime> {
+    let rest = url.split_once("expire=").or_else(|| url.split_once("/expire/"))?.1;
+    let secs: u64 = rest.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()?;
+    Some(UNIX_EPOCH + Duration::from_secs(secs))
+}
+
+/// Until when an answer can be used
+fn usable_until(s: &Stream) -> SystemTime {
+    let now = SystemTime::now();
+    let urls = [Some(&s.video), s.sound.as_ref()];
+    let expiries: Vec<SystemTime> = urls
+        .into_iter()
+        .flatten()
+        .filter_map(|i| match i {
+            Input::Url { url, .. } => expiry(url),
+            Input::File(_) => None,
+        })
+        .collect();
+    match expiries.into_iter().min() {
+        Some(e) => (e - EXPIRY_MARGIN).min(now + KEEP_MAX),
+        None => now + KEEP_UNKNOWN,
+    }
+}
+
+/// The addresses for `url`: a kept answer when there is one (`fresh`: never), otherwise
+/// yt-dlp's. Waits when the same address is being looked up already. Also returns whether
+/// the answer was a kept one.
+fn resolve_kept(url: &str, cancel: &AtomicBool, mut fresh: bool) -> Result<(Stream, bool)> {
+    loop {
+        {
+            let mut a = ANSWERS.lock().unwrap();
+            let now = SystemTime::now();
+            a.ready.retain(|(u, _, until)| *until > now && !(fresh && u == url));
+            fresh = false;
+            if let Some((_, s, _)) = a.ready.iter().find(|(u, _, _)| u == url) {
+                return Ok((s.clone(), true));
+            }
+            if !a.pending.iter().any(|u| u == url) {
+                a.pending.push(url.to_string());
+                break;
+            }
+        }
+        if cancel.load(Ordering::SeqCst) {
+            bail!("cancelled");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let r = resolve(url, cancel);
+    let mut a = ANSWERS.lock().unwrap();
+    a.pending.retain(|u| u != url);
+    if let Ok(s) = &r {
+        a.ready.retain(|(u, _, _)| u != url);
+        a.ready.push((url.to_string(), s.clone(), usable_until(s)));
+    }
+    r.map(|s| (s, false))
+}
+
+/// Drop the kept answer for `url` (it did not play)
+fn forget(url: &str) {
+    ANSWERS.lock().unwrap().ready.retain(|(u, _, _)| u != url);
+}
+
+/// Look up `url` in the background, so it starts quickly when it is chosen.
+fn look_up_in_advance(url: String) {
+    let _ = std::thread::Builder::new().name("yt-dlp-ahead".into()).spawn(move || {
+        if let Err(e) = resolve_kept(&url, &AtomicBool::new(false), false) {
+            eprintln!("youtube: looking up {url} in advance: {e:#}");
+        }
+    });
 }
 
 /// Asks yt-dlp for the stream's addresses (takes a few seconds).
@@ -148,7 +238,7 @@ enum State {
     /// A fixed picture: stopped, no address, failed
     Still(Frame565),
     Resolving {
-        rx: Receiver<Result<Stream>>,
+        rx: Receiver<Result<(Stream, bool)>>,
         cancel: Arc<AtomicBool>,
         since: Instant,
     },
@@ -157,11 +247,11 @@ enum State {
         live: bool,
         since: Instant,
         ended: bool,
+        /// Paused since then
+        paused_at: Option<Instant>,
     },
     /// Waiting before connecting to the live stream again
     Retry(Instant),
-    /// Waiting a moment before starting (the mode was just chosen)
-    Delay(Instant),
 }
 
 pub struct YouTubeScreen {
@@ -171,18 +261,25 @@ pub struct YouTubeScreen {
     sound_on: Arc<AtomicBool>,
     state: State,
     title: Option<String>,
+    /// Name of the favourite, for the status line while loading
+    name: Option<String>,
+    /// The addresses playing are a kept answer (when they fail, yt-dlp is asked again)
+    kept: bool,
+    /// Looked up in the background once this one plays (the next address of a double tap)
+    ahead: Option<String>,
     retries: u32,
     /// Status not yet reported
     status: Option<ScreenStatus>,
 }
 
 impl YouTubeScreen {
-    /// Starts playing `url` after `delay` (or shows that nothing plays). The sound is heard
+    /// Starts playing `url` (or shows that nothing plays). The sound is heard
     /// while `sound_on` is set; it can be switched while playing.
     pub fn new(
         url: Option<&str>,
+        name: Option<String>,
+        ahead: Option<String>,
         playing: bool,
-        delay: Duration,
         fit: Scaling,
         size: Size,
         sound_on: Arc<AtomicBool>,
@@ -195,6 +292,9 @@ impl YouTubeScreen {
             sound_on,
             state: State::Still(Vec::new()),
             title: None,
+            name,
+            kept: false,
+            ahead,
             retries: 0,
             status: None,
         };
@@ -202,9 +302,6 @@ impl YouTubeScreen {
             s.still(&["No YouTube", "address"], [255, 255, 255], "YouTube: enter the address of a stream or video");
         } else if !playing {
             s.still(&["YouTube", "stopped"], [255, 255, 255], "YouTube: stopped");
-        } else if delay > Duration::ZERO {
-            s.state = State::Delay(Instant::now() + delay);
-            s.report("YouTube: starting...".into());
         } else {
             s.start();
         }
@@ -226,17 +323,22 @@ impl YouTubeScreen {
     }
 
     fn start(&mut self) {
+        self.start_with(false);
+    }
+
+    /// `fresh`: ask yt-dlp even when an answer is kept
+    fn start_with(&mut self, fresh: bool) {
         let (tx, rx) = channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let (url, c) = (self.url.clone(), cancel.clone());
         let spawned = std::thread::Builder::new().name("yt-dlp".into()).spawn(move || {
-            let _ = tx.send(resolve(&url, &c));
+            let _ = tx.send(resolve_kept(&url, &c, fresh));
         });
         if spawned.is_err() {
             return self.fail("cannot start yt-dlp");
         }
         self.state = State::Resolving { rx, cancel, since: Instant::now() };
-        let what = self.title.clone().unwrap_or_else(|| self.url.clone());
+        let what = self.title.clone().or_else(|| self.name.clone()).unwrap_or_else(|| self.url.clone());
         self.report(format!("YouTube: loading {what}..."));
     }
 
@@ -263,7 +365,8 @@ impl Screen for YouTubeScreen {
             State::Resolving { rx, since, .. } => {
                 let since = *since;
                 match rx.try_recv() {
-                    Ok(Ok(stream)) => {
+                    Ok(Ok((stream, kept))) => {
+                        self.kept = kept;
                         let screen = VideoScreen::stream(
                             &stream.video,
                             stream.sound.as_ref(),
@@ -284,7 +387,12 @@ impl Screen for YouTubeScreen {
                                     live: stream.live,
                                     since: Instant::now(),
                                     ended: false,
+                                    paused_at: None,
                                 };
+                                // the next address, for a double tap
+                                if let Some(next) = self.ahead.take().filter(|n| *n != self.url) {
+                                    look_up_in_advance(next);
+                                }
                             }
                             Err(e) => self.fail(&format!("{e:#}")),
                         }
@@ -306,7 +414,7 @@ impl Screen for YouTubeScreen {
                     Err(TryRecvError::Empty) => (self.loading(since), Duration::from_millis(100)),
                 }
             }
-            State::Playing { screen, live, since, ended } => {
+            State::Playing { screen, live, since, ended, .. } => {
                 let (frame, wait) = screen.render();
                 let frame = if screen.started() { frame } else { loading(*since, self.size) };
                 if *ended {
@@ -315,6 +423,16 @@ impl Screen for YouTubeScreen {
                 let (live, played) = (*live, since.elapsed());
                 let error = screen.error().map(str::to_string);
                 let finished = screen.finished();
+                let started = screen.started();
+                if (error.is_some() || (live && finished)) && self.kept && !started {
+                    // the kept addresses no longer work: ask yt-dlp again, right away
+                    self.kept = false;
+                    self.start_with(true);
+                    return (frame, wait);
+                }
+                if error.is_some() || (live && finished) {
+                    forget(&self.url);
+                }
                 if error.is_some() || finished {
                     if played > Duration::from_secs(60) {
                         self.retries = 0; // it played for a while: start counting again
@@ -334,12 +452,6 @@ impl Screen for YouTubeScreen {
                 }
                 (frame, wait)
             }
-            State::Delay(at) => {
-                if Instant::now() >= *at {
-                    self.start();
-                }
-                (render::message(&["YouTube"], [255, 255, 255], self.size), Duration::from_millis(100))
-            }
             State::Retry(at) => {
                 if Instant::now() >= *at {
                     self.start();
@@ -353,7 +465,35 @@ impl Screen for YouTubeScreen {
     fn status(&mut self) -> Option<ScreenStatus> {
         self.status.take()
     }
+
+    fn toggle_pause(&mut self) -> Option<bool> {
+        match &self.state {
+            // a video that ended: play it again
+            State::Playing { ended: true, .. } => {
+                self.start();
+                return Some(false);
+            }
+            State::Playing { .. } => {}
+            _ => return None,
+        }
+        let State::Playing { screen, live, paused_at, .. } = &mut self.state else { return None };
+        let live = *live;
+        let resume_live_late = live && paused_at.is_some_and(|at| at.elapsed() > LIVE_RESUME_LATE);
+        let paused = screen.toggle_pause()?;
+        *paused_at = paused.then(Instant::now);
+        let title = self.title.clone().unwrap_or_default();
+        if resume_live_late {
+            // the pictures waiting are old: connect again to show what is live now
+            self.start();
+            return Some(false);
+        }
+        self.report(if paused { format!("YouTube: {title} (paused)") } else { format!("YouTube: {title}") });
+        Some(paused)
+    }
 }
+
+/// A live stream paused longer than this connects again when it goes on
+const LIVE_RESUME_LATE: Duration = Duration::from_secs(30);
 
 impl Drop for YouTubeScreen {
     fn drop(&mut self) {
@@ -370,4 +510,56 @@ pub fn favorite_url(favorites: &[crate::config::Favorite], name_or_url: &str) ->
         .find(|f| f.name.eq_ignore_ascii_case(name_or_url.trim()))
         .map(|f| f.url.clone())
         .unwrap_or_else(|| name_or_url.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stream(url: &str) -> Stream {
+        Stream {
+            title: "t".into(),
+            live: false,
+            video: Input::Url { url: url.into(), headers: Vec::new() },
+            sound: None,
+        }
+    }
+
+    #[test]
+    fn expiry_from_youtube_addresses() {
+        let at = |s: u64| Some(UNIX_EPOCH + Duration::from_secs(s));
+        assert_eq!(expiry("https://rr1.googlevideo.com/videoplayback?expire=1762400000&ei=x"), at(1762400000));
+        assert_eq!(
+            expiry("https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/1762400000/ei/x"),
+            at(1762400000)
+        );
+        assert_eq!(expiry("https://example.com/video.mp4"), None);
+        // used until 15 minutes before it expires, at most 5 hours
+        let soon = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 3600;
+        let until = usable_until(&stream(&format!("https://x/videoplayback?expire={soon}")));
+        assert_eq!(until, UNIX_EPOCH + Duration::from_secs(soon) - EXPIRY_MARGIN);
+        let far = soon + 24 * 3600;
+        let until = usable_until(&stream(&format!("https://x/videoplayback?expire={far}")));
+        assert!(until <= SystemTime::now() + KEEP_MAX);
+    }
+
+    #[test]
+    fn kept_answers_are_used_until_forgotten() {
+        let url = "https://www.youtube.com/watch?v=kept-test";
+        let until = SystemTime::now() + Duration::from_secs(600);
+        ANSWERS.lock().unwrap().ready.push((url.into(), stream("https://x/v?expire=1"), until));
+        let (s, kept) = resolve_kept(url, &AtomicBool::new(false), false).unwrap();
+        assert!(kept);
+        assert!(matches!(s.video, Input::Url { ref url, .. } if url == "https://x/v?expire=1"));
+        forget(url);
+        assert!(!ANSWERS.lock().unwrap().ready.iter().any(|(u, _, _)| u == url));
+        // expired answers are not used
+        let old = SystemTime::now() - Duration::from_secs(1);
+        ANSWERS.lock().unwrap().ready.push((url.into(), stream("https://x/old"), old));
+        let cancel = AtomicBool::new(true); // no yt-dlp in tests: stop at once
+        ANSWERS.lock().unwrap().pending.push(url.into()); // as if it were being looked up
+        assert!(resolve_kept(url, &cancel, false).is_err());
+        ANSWERS.lock().unwrap().pending.retain(|u| u != url);
+        assert!(!ANSWERS.lock().unwrap().ready.iter().any(|(u, _, _)| u == url));
+    }
 }

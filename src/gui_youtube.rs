@@ -1,7 +1,8 @@
 //! YouTube part of the control window: address, play / stop, sound, favourites.
 
-use crate::config::{Config, Favorite};
-use crate::controller::Handle;
+use crate::config::{Config, Favorite, Mode};
+use crate::controller::{Handle, Media, Status};
+use crate::gui::{play_label, Refresh};
 use std::cell::RefCell;
 use std::rc::Rc;
 use wxdragon::prelude::*;
@@ -9,7 +10,7 @@ use wxdragon::prelude::*;
 const TITLE: &str = "Open MSU2_MINI";
 
 /// Builds the "YouTube" box.
-pub fn build(panel: &Panel, frame: Frame, handle: &Rc<RefCell<Handle>>, cfg: &Config) -> StaticBoxSizer {
+pub fn build(panel: &Panel, frame: Frame, handle: &Rc<RefCell<Handle>>, cfg: &Config) -> (StaticBoxSizer, Refresh) {
     let yt_box = StaticBoxSizerBuilder::new_with_label(Orientation::Vertical, panel, "YouTube").build();
     let p = yt_box.get_static_box().unwrap();
     let cv = SizerFlag::AlignCenterVertical;
@@ -25,7 +26,8 @@ pub fn build(panel: &Panel, frame: Frame, handle: &Rc<RefCell<Handle>>, cfg: &Co
         "Address of a YouTube live stream or video, e.g. https://www.youtube.com/@channel/live\n\
          (other sites yt-dlp supports work too). Enter or Play starts it.",
     );
-    let play = Button::builder(&p).with_label("▶ Play").build();
+    let play = Button::builder(&p).with_label(play_label(false)).build();
+    play.set_tooltip("Play the address, or pause and go on (like a tap on the device's touch button).");
     let stop = Button::builder(&p).with_label("■ Stop").build();
     let sound = CheckBox::builder(&p).with_label("Sound").build();
     sound.set_value(cfg.youtube_sound);
@@ -42,12 +44,21 @@ pub fn build(panel: &Panel, frame: Frame, handle: &Rc<RefCell<Handle>>, cfg: &Co
         })
     };
     {
-        let s = start.clone();
-        play.on_click(move |_| s());
+        // the address playing: pause / go on; another address (or stopped): play it
+        let (h, s) = (handle.clone(), start.clone());
+        play.on_click(move |_| {
+            let u = url.get_value().trim().to_string();
+            let c = h.borrow().cfg.lock().unwrap().clone();
+            if c.mode == Mode::YouTube && c.youtube_playing && c.youtube_url.as_deref() == Some(u.as_str()) {
+                h.borrow().play_pause();
+            } else {
+                s();
+            }
+        });
         let s = start.clone();
         url.on_text_enter(move |_| s());
         let h = handle.clone();
-        stop.on_click(move |_| h.borrow().update(|c| c.youtube_playing = false));
+        stop.on_click(move |_| h.borrow().stop_media());
         let h = handle.clone();
         sound.on_toggled(move |_| h.borrow().set_youtube_sound(sound.get_value()));
     }
@@ -149,7 +160,21 @@ pub fn build(panel: &Panel, frame: Frame, handle: &Rc<RefCell<Handle>>, cfg: &Co
     grid.add_sizer(&row, 1, SizerFlag::Expand | cv, 0);
 
     yt_box.add_sizer(&grid, 0, SizerFlag::Expand | SizerFlag::All, 6);
-    yt_box
+
+    // the touch button can switch the address; the button shows Play or Pause
+    let last_url = RefCell::new(cfg.youtube_url.clone());
+    let refresh: Refresh = Rc::new(move |s: &Status, c: &Config| {
+        if *last_url.borrow() != c.youtube_url {
+            *last_url.borrow_mut() = c.youtube_url.clone();
+            url.set_value(c.youtube_url.as_deref().unwrap_or_default());
+            fill(c.youtube_url.as_deref());
+        }
+        let l = play_label(s.mode == Mode::YouTube && s.media == Media::Playing);
+        if play.get_label() != l {
+            play.set_label(l);
+        }
+    });
+    (yt_box, refresh)
 }
 
 fn warn(frame: &Frame, msg: &str) {

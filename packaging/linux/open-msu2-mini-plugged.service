@@ -1,0 +1,19 @@
+# Opens the Open MSU2_MINI window when the screen is plugged in. Switched on with
+#   systemctl --user enable open-msu2-mini-plugged.service
+# (or in the window). Does nothing when the window or a background instance already runs.
+[Unit]
+Description=Open MSU2_MINI window (screen plugged in)
+# the window needs the desktop; until it is there, starting fails and is tried again
+After=graphical-session.target
+PartOf=graphical-session.target
+StartLimitIntervalSec=120
+StartLimitBurst=10
+
+[Service]
+Type=simple
+ExecStart=@BIN@ gui --plugged
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=open-msu2-mini-plugged.target

@@ -595,6 +595,12 @@ fn selected_disks<'a>(disks: &'a Disks, sel: &DiskSelect) -> Vec<&'a sysinfo::Di
     }
 }
 
+/// Something is mounted here (also a partition that `drive_choices` lists under another
+/// mount point, such as a btrfs `/home` next to `/`)
+pub fn is_mounted(mount: &str) -> bool {
+    Disks::new_with_refreshed_list().is_ok_and(|d| d.iter().any(|d| d.mount_point().to_string_lossy() == mount))
+}
+
 /// Drives for the settings dialog: (mount point, description)
 pub fn drive_choices() -> Vec<(String, String)> {
     let Ok(disks) = Disks::new_with_refreshed_list() else { return Vec::new() };

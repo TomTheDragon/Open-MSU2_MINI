@@ -24,11 +24,18 @@ It replaces the vendor's Windows-only demo tool and runs on **Linux, Windows and
   both must be installed; other sites yt-dlp supports (e.g. Twitch) work too. A live stream
   that breaks off is connected again.
 - **Two slots on the device**: Slot1 holds an image, Slot2 an image or a GIF. Without a PC
-  the device shows Slot2 by itself, and its button switches to Slot1.
+  the device shows Slot2 by itself, and its touch button switches to Slot1.
 - **Rotation by 0°, 90°, 180° or 270°.** At 90° and 270° the screen can stand upright; the
   system monitor and the clock then use portrait layouts.
-- The **button on the device** cycles through all modes (Image, GIF and Video once a file is
+- The **touch button on the device**: a short tap pauses or plays the video, GIF, YouTube
+  stream or Slot2 animation (a small pause sign shows in the corner); holding it for half a
+  second switches to the next mode. In YouTube mode a double tap plays the next address
+  (the typed one, then each favourite, then the typed one again); there a single tap
+  pauses a moment later, once it is clear no second tap follows. *Touch button (hold): Choose modes...*
+  sets which modes it goes through (all by default; Image, GIF and Video once a file is
   chosen for them, YouTube once an address is entered).
+- **Linux: open the window when the screen is plugged in** (optional, *General* → *Screen
+  plugged in*; see [Install](#install)).
 - **Native window** that follows your desktop theme: GTK on Linux, Win32 with dark mode on
   Windows, Cocoa on macOS. Optionally with an icon in the notification area (system tray)
   and started minimized.
@@ -39,9 +46,9 @@ It replaces the vendor's Windows-only demo tool and runs on **Linux, Windows and
 
 ![System monitor and clock in portrait, for an upright screen (90°/270° rotation)](docs/screens-portrait.png)
 
-![The control window (KDE Plasma, dark theme)](docs/window-main.png)
+![The control window playing a YouTube live stream (KDE Plasma, dark theme)](docs/window-main.png)
 
-![System monitor settings: values, graphic, value position and colours](docs/window-system-monitor.png)
+![System monitor settings: values (disk rows with their own drive), graphic, value position and colours](docs/window-system-monitor.png)
 
 > Not affiliated with the hardware's manufacturer. The USB protocol was worked out from the
 > behaviour of the vendor's tool; see [Protocol](#protocol).
@@ -94,11 +101,20 @@ libraries yourself (most are already there on a desktop system):
 | **openSUSE** Tumbleweed | `sudo zypper install libgtk-3-0 libpipewire-0_3-0 libayatana-appindicator3-1 libasound2 libSM6 ffmpeg` |
 
 Then `chmod +x open-msu2-mini-linux-x86_64` and run it, or install it for your user with
-`packaging/linux/install.sh [--udev] [--autostart]` from a copy of this repository: it
+`packaging/linux/install.sh [--udev] [--autostart] [--plugged]` from a copy of this repository: it
 copies the program to `~/.local/bin`, adds an app-menu entry and optionally autostart and
 the udev rule, and reports missing libraries. **Device access:** without the udev rule (packages install it), add yourself to the
 group that owns serial ports and log in again: `sudo usermod -aG dialout $USER` (Arch:
 `uucp` instead of `dialout`).
+
+**Open the window when the screen is plugged in** (optional): the packages install a udev
+rule (`71-open-msu2-mini-plugged.rules`) and a systemd user service that stay off until you
+tick *General → Screen plugged in: Open this window when the screen is plugged in* (or run
+`systemctl --user enable open-msu2-mini-plugged.service`). udev itself cannot open windows,
+so the rule asks your user session to start the service. It also opens the window at login
+when the screen is plugged in then, and does nothing when the window or `open-msu2-mini run`
+already runs. Without a package: `packaging/linux/install.sh --plugged` (needs systemd; not
+available for the AppImage).
 
 **yt-dlp** is only needed for the YouTube mode (`sudo apt install yt-dlp`,
 `sudo dnf install yt-dlp`, `sudo pacman -S yt-dlp`, `sudo zypper install yt-dlp`). YouTube
@@ -150,23 +166,34 @@ open-msu2-mini --help
   | ⚠ small changes only | 90–120 fps | Above the panel's ~61 fps limit: only small changes (mouse, small video) reach it; more CPU |
 
 - **Window:** choose a mode at the top; below it the window shows that mode's settings
-  (they change with the mode, also when the device's button switches it). Rotation,
+  (they change with the mode, also when the device's touch button switches it). Rotation,
   scaling, brightness and the window icon are under *General*, for all modes.
 - **System monitor:** choose the values, their order and the look with *Customize…* on the
   System monitor page (or edit the `stats` section of the settings file).
 - **YouTube:** enter the address of a live stream or video on the YouTube page and press *Play*
   (or Enter). A channel's `https://www.youtube.com/@name/live` address always plays its
-  current live stream. *Stop* stops it, *Sound* switches the sound on and off without
+  current live stream. While it plays, the button is *Pause* (and *Play* again goes on).
+  *Stop* stops it, *Sound* switches the sound on and off without
   interrupting the stream. *Add...* saves the address as a favourite (named after the stream's
   title); choosing a favourite plays it. The picture is played at 240p (plenty for the
   screen, and it saves bandwidth), the sound in the best quality there is (live streams:
   AAC ~128 kbps; videos: usually Opus ~130–160 kbps or AAC 128 kbps). Videos play once; their
   last picture stays. Choosing the YouTube mode (in the window, the tray menu or with the
-  device's button) plays the last address by itself after two seconds. When the screen is
-  unplugged, the stream stops; press *Play* or choose the mode again to start it again.
+  device's touch button) plays the last address right away; a double tap on the touch button
+  switches to the next address (the typed one and the favourites). Starting takes 2–3.5 s the first
+  time (yt-dlp looks up the stream; `@channel/live` addresses take longest), and about a
+  second when the same address plays again within a few hours (yt-dlp's answer is kept until
+  shortly before YouTube's addresses expire). While one plays, the next address of the double
+  tap is looked up in the background, so switching is quick too. When the screen is
+  unplugged, the stream stops, and it starts again by itself when the screen is plugged back
+  in (with YouTube still chosen). A live stream paused for more than 30 seconds connects
+  again when it goes on, so it shows what is live now.
+- **Video:** *Play* / *Pause* and *Stop* on the Video page (or a tap on the touch button to
+  pause and play). *Stop* shows "Video stopped"; *Play* starts it from the beginning, also after
+  a video without *Loop* has ended.
 - **Slots on the device:** *Upload Slot1 (image)…* and *Upload Slot2 (image or GIF)…* keep
   a picture and a picture or GIF in the device's flash; the modes *Slot1 on device* and
-  *Slot2 on device* show them. Without a PC the device shows Slot2, and its button switches
+  *Slot2 on device* show them. Without a PC the device shows Slot2, and its touch button switches
   to Slot1. Brightness does not affect them, and they are turned when they are written, so
   upload them again after switching between landscape and portrait.
 - **System monitor values:** `open-msu2-mini sysinfo` prints every value as this computer
@@ -195,7 +222,7 @@ for the LCD to draw a full frame. The vendor tool always sends complete frames. 
 2. **Uses block deltas.** Pixels travel through a 256-byte buffer on the device that keeps
    its content between blocks. Each block is sent either as "changes against the previous
    block" or as "fill pattern + changes", whichever is smaller.
-3. **Streams without waiting for acknowledgements.** A button poll every 200 ms provides
+3. **Streams without waiting for acknowledgements.** A touch button poll every 100 ms provides
    flow control and keeps the link alive; the device goes offline after ~5 s of silence.
 4. **Captures cheaply.** Frames are scaled to 160×80 in the capture thread: PipeWire on
    Linux, DXGI desktop duplication on Windows, AVFoundation on macOS.
@@ -262,7 +289,7 @@ Apple Silicon) on every push. A `v*` tag publishes the executables as a release.
 | Path | Contents |
 |---|---|
 | `src/device.rs` | USB protocol, frame encoder, flash access |
-| `src/controller.rs` | Background thread: connection, keep-alive, button, modes |
+| `src/controller.rs` | Background thread: connection, keep-alive, touch button, modes |
 | `src/capture/` | Screen capture (portal + PipeWire on Linux, xcap on Windows/macOS) |
 | `src/stats.rs` | System monitor |
 | `src/render.rs`, `src/scale.rs` | Clock, pictures, text; scaling to the panel or a portrait canvas |
@@ -297,7 +324,7 @@ The baud rate is ignored. Every command is 6 bytes. Pixels are RGB565, big-endia
 | `03 00 a2 a1 a0 00` | Read the flash byte at address `a`; the reply's last byte is the value |
 | `03 02 ph pl nh nl` | Erase `n` flash pages starting at page `p` |
 | `03 03 p2 p1 p0 01` | Write the block buffer to flash page `p` |
-| `08 ch 00 00 00 00` | Read ADC channel `ch` (channel 9 = push button; pressed = lower value) |
+| `08 ch 00 00 00 00` | Read ADC channel `ch` (channel 9 = touch button; touched = lower value) |
 
 Further notes:
 
@@ -315,7 +342,7 @@ Further notes:
   repeats this test with the test number shown on the screen, for other firmware versions.
 - Offline, the firmware shows the entries of a directory at address `0x0FFE00` (32 bytes
   each: flags, frame interval, frame count, start page, size): the animation at page 0 and
-  the still picture at page 3826; the device's button switches between them. Thanks to
+  the still picture at page 3826; the device's touch button switches between them. Thanks to
   [kxn/msu2-ip-display](https://github.com/kxn/msu2-ip-display) for the firmware analysis.
 
 ## License
