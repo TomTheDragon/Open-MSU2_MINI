@@ -111,12 +111,56 @@ pub fn list_ports() -> Vec<PortInfo> {
     if exact.is_empty() {
         exact = other;
     }
+    forget_shared_serials(&mut exact);
     exact
+}
+
+/// Many MSU2 units report the same placeholder serial number (e.g. "0123456789"). A serial
+/// number that several connected ports share cannot tell them apart, so those ports are
+/// identified by their port name only.
+fn forget_shared_serials(ports: &mut [PortInfo]) {
+    let shared: Vec<String> = ports
+        .iter()
+        .filter_map(|p| p.serial.clone())
+        .filter(|s| ports.iter().filter(|q| q.serial.as_ref() == Some(s)).count() > 1)
+        .collect();
+    for p in ports {
+        if p.serial.as_ref().is_some_and(|s| shared.contains(s)) {
+            p.serial = None;
+        }
+    }
+}
+
+#[cfg(test)]
+mod port_tests {
+    use super::*;
+
+    fn port(name: &str, serial: Option<&str>) -> PortInfo {
+        PortInfo { name: name.into(), serial: serial.map(Into::into), exact: true }
+    }
+
+    #[test]
+    fn shared_serial_numbers_are_dropped() {
+        let mut ports = vec![
+            port("/dev/ttyACM0", Some("0123456789")),
+            port("/dev/ttyACM1", Some("0123456789")),
+            port("/dev/ttyACM2", Some("A1B2")),
+            port("/dev/ttyACM3", None),
+        ];
+        forget_shared_serials(&mut ports);
+        let serials: Vec<_> = ports.iter().map(|p| p.serial.as_deref()).collect();
+        assert_eq!(serials, [None, None, Some("A1B2"), None]);
+    }
 }
 
 /// Names of the ports from `list_ports`.
 pub fn find_ports() -> Vec<String> {
     list_ports().into_iter().map(|p| p.name).collect()
+}
+
+/// Number of connected MSU2 screens (by their USB IDs)
+pub fn count_screens() -> usize {
+    list_ports().iter().filter(|p| p.exact).count()
 }
 
 pub struct Device {
@@ -146,15 +190,21 @@ impl Device {
     /// Open the chosen device: the one with this USB serial number if it is connected
     /// (its port name can change), else the port; with neither, the first one found.
     pub fn open_chosen(port: Option<&str>, serial: Option<&str>) -> Result<Device> {
+        Self::open_avoiding(port, serial, &[])
+    }
+
+    /// Like `open_chosen`; with neither port nor serial number, the first one found that is
+    /// not in `avoid` (the ports other displays use).
+    pub fn open_avoiding(port: Option<&str>, serial: Option<&str>, avoid: &[String]) -> Result<Device> {
         let by_serial =
             serial.and_then(|s| list_ports().into_iter().find(|p| p.serial.as_deref() == Some(s))).map(|p| p.name);
         let candidates = match (by_serial, port) {
             (Some(p), _) => vec![p],
             (None, Some(p)) => vec![p.to_string()],
-            (None, None) => find_ports(),
+            (None, None) => find_ports().into_iter().filter(|p| !avoid.contains(p)).collect(),
         };
         if candidates.is_empty() {
-            bail!("no MSU2 device found");
+            bail!(if avoid.is_empty() { "no MSU2 device found" } else { "no other MSU2 device found" });
         }
         let mut last = anyhow!("no MSU2 device found");
         for name in candidates {

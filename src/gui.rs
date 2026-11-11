@@ -68,6 +68,9 @@ pub fn play_label(playing: bool) -> &'static str {
 /// Keeps a page up to date with what plays (called by the window's timer)
 pub type Refresh = Rc<dyn Fn(&controller::Status, &Config)>;
 
+/// Shows a display's settings in the controls (when another display is chosen)
+pub type Load = Box<dyn Fn(&Config)>;
+
 /// Size of a list box that shows about `rows` entries at once.
 pub fn list_size(parent: &dyn WxWidget, width: i32, rows: usize) -> Size {
     let row = parent.get_char_height().max(12) + 10;
@@ -164,24 +167,46 @@ pub fn run(port: Option<String>) -> Result<()> {
         None => false,
     };
 
-    let mut cfg = Config::load();
+    // one display per connected screen (at least the saved ones)
+    let mut cfgs = Config::load_displays(crate::device::count_screens());
     if port.is_some() {
-        cfg.port = port;
-        cfg.device_serial = None;
+        cfgs[0].port = port;
+        cfgs[0].device_serial = None;
     }
 
     config::set_gui_pid(true);
     let result = wxdragon::main(move |_| {
         // Follow the system light/dark setting (needed on Windows, automatic elsewhere).
         let _ = set_appearance(Appearance::System);
-        build(cfg, resume_background);
+        build(cfgs, resume_background);
     });
     config::set_gui_pid(false);
     result.map_err(|e| anyhow::anyhow!("{e}"))
 }
 
-fn build(cfg: Config, resume_background: bool) {
+fn build(cfgs: Vec<Config>, resume_background: bool) {
+    // Every display has its own controller, and all of them run. The controls show and change
+    // the chosen one: `handle` holds its controller, `parked` the others (by display number,
+    // None at the chosen one's place).
+    let mut cfgs = cfgs.into_iter();
+    let cfg = cfgs.next().expect("settings of the first display");
     let handle = Rc::new(RefCell::new(controller::spawn(cfg.clone(), true, |_| {})));
+    let parked: Rc<RefCell<Vec<Option<controller::Handle>>>> = Rc::new(RefCell::new(
+        std::iter::once(None).chain(cfgs.map(|c| Some(controller::spawn(c, true, |_| {})))).collect(),
+    ));
+    let active = Rc::new(Cell::new(0usize));
+    // settings that belong to the window, not to a display: changed for all displays
+    let for_all = {
+        let (h, parked) = (handle.clone(), parked.clone());
+        Rc::new(move |f: &dyn Fn(&mut Config)| {
+            h.borrow().update(|c| f(c));
+            for p in parked.borrow().iter().flatten() {
+                p.update(|c| f(c));
+            }
+        })
+    };
+    // what shows the chosen display's settings
+    let mut loaders: Vec<Load> = Vec::new();
 
     let frame = Frame::builder().with_title(crate::APP_TITLE).build();
     if let Some(icon) =
@@ -192,6 +217,22 @@ fn build(cfg: Config, resume_background: bool) {
     let panel = Panel::builder(&frame).build();
     let root = BoxSizer::builder(Orientation::Vertical).build();
     let pad = 8;
+
+    // -- display (screen) --------------------------------------------------------------
+    let display_row = BoxSizer::builder(Orientation::Horizontal).build();
+    let display_title = StaticText::builder(&panel).with_label("Display:").build();
+    let display_choice = Choice::builder(&panel).build();
+    for i in 0..parked.borrow().len() {
+        display_choice.append(&format!("Display {}", i + 1));
+    }
+    display_choice.set_selection(0);
+    display_choice.set_tooltip(
+        "Each connected screen is a display with its own settings, and all of them run at the\n\
+         same time. Choose the one to change here; \"Search again\" adds newly plugged-in screens.",
+    );
+    display_row.add(&display_title, 0, SizerFlag::AlignCenterVertical | SizerFlag::Right, 4);
+    display_row.add(&display_choice, 1, SizerFlag::AlignCenterVertical, 0);
+    root.add_sizer(&display_row, 0, SizerFlag::Expand | SizerFlag::Left | SizerFlag::Right | SizerFlag::Top, pad);
 
     // -- device ---------------------------------------------------------------------
     let dev_row = BoxSizer::builder(Orientation::Horizontal).build();
@@ -209,13 +250,21 @@ fn build(cfg: Config, resume_background: bool) {
                 let c = h.borrow().cfg.lock().unwrap().clone();
                 (c.port, c.device_serial)
             };
+            let me = h.borrow().display;
             let mut list: Vec<(DeviceChoice, String)> =
-                vec![((None, None), "Automatic (the first one found)".to_string())];
+                vec![((None, None), "Automatic (the first free one)".to_string())];
             for p in crate::device::list_ports() {
-                let text = if p.exact { p.describe() } else { format!("{}   (other USB device)", p.describe()) };
+                let mut text = if p.exact { p.describe() } else { format!("{}   (other USB device)", p.describe()) };
+                if let Some(d) = controller::display_using(&p.name).filter(|d| *d != me) {
+                    text = format!("{text}   (used by display {})", d + 1);
+                }
                 list.push(((Some(p.name), p.serial), text));
             }
-            let chosen = |e: &DeviceChoice| match &serial {
+            // the saved serial number, if a listed device still has it (one that several
+            // devices share is not listed, see list_ports); otherwise the saved port.
+            // Same rule as Device::open_chosen, so the list shows the device in use.
+            let found = serial.clone().filter(|s| list.iter().any(|(e, _)| e.1.as_ref() == Some(s)));
+            let chosen = |e: &DeviceChoice| match &found {
                 Some(s) => e.1.as_ref() == Some(s),
                 None => e.0 == port,
             };
@@ -236,14 +285,33 @@ fn build(cfg: Config, resume_background: bool) {
     };
     fill_devices();
     {
+        let fill = fill_devices.clone();
+        loaders.push(Box::new(move |_: &Config| fill()));
+    }
+    {
         let (h, entries) = (handle.clone(), dev_entries.clone());
         dev_choice.on_selection_changed(move |e| {
             let Some(i) = e.get_selection() else { return };
             let Some((port, serial)) = entries.borrow().get(i as usize).cloned() else { return };
             h.borrow().set_device(port, serial);
         });
-        let fill = fill_devices.clone();
-        dev_search.on_click(move |_| fill());
+        // also adds a display for each newly plugged-in screen
+        let (h, parked, fill) = (handle.clone(), parked.clone(), fill_devices.clone());
+        dev_search.on_click(move |_| {
+            let screens = crate::device::count_screens();
+            let mut p = parked.borrow_mut();
+            while p.len() < screens {
+                let first = match &p[0] {
+                    Some(h0) => h0.cfg.lock().unwrap().clone(),
+                    None => h.borrow().cfg.lock().unwrap().clone(),
+                };
+                let c = Config::new_display(&first, p.len());
+                p.push(Some(controller::spawn(c, true, |_| {})));
+                display_choice.append(&format!("Display {}", p.len()));
+            }
+            drop(p);
+            fill();
+        });
     }
     dev_row.add(&dev_title, 0, SizerFlag::AlignCenterVertical | SizerFlag::Right, 4);
     dev_row.add(&dev_choice, 1, SizerFlag::AlignCenterVertical, 0);
@@ -284,6 +352,15 @@ fn build(cfg: Config, resume_background: bool) {
         radios.push((m, rb));
     }
     mode_box.add_sizer(&mode_grid, 0, SizerFlag::Expand | SizerFlag::All, 6);
+    {
+        let radios = radios.clone();
+        loaders.push(Box::new(move |c: &Config| {
+            for (m, rb) in &radios {
+                rb.set_value(*m == c.mode);
+            }
+            book.set_selection(page_of(c.mode));
+        }));
+    }
     root.add_sizer(&mode_box, 0, SizerFlag::Expand | SizerFlag::Left | SizerFlag::Right, pad);
 
     let cv = SizerFlag::AlignCenterVertical;
@@ -342,6 +419,15 @@ fn build(cfg: Config, resume_background: bool) {
                 }
             });
         }
+        {
+            let note = fps_note;
+            loaders.push(Box::new(move |c: &Config| {
+                let i = FPS_CHOICES.iter().position(|f| *f >= c.max_fps - 0.001).unwrap_or(FPS_CHOICES.len() - 1);
+                fps.set_selection(i as u32);
+                note.set_label(fps_class(FPS_CHOICES[i]).explanation());
+                note.wrap(300);
+            }));
+        }
         grid.add(&label(&bx, "Speed limit:"), 0, cv, 0);
         grid.add(&fps, 0, cv, 0);
         grid.add(&label(&bx, ""), 0, cv, 0);
@@ -380,6 +466,9 @@ fn build(cfg: Config, resume_background: bool) {
                 }
             });
         }
+        loaders.push(Box::new(move |c: &Config| {
+            region.set_value(&c.region.map(|r| format!("{},{},{},{}", r[0], r[1], r[2], r[3])).unwrap_or_default());
+        }));
         grid.add(&label(&bx, "Area (x,y,w,h):"), 0, cv, 0);
         grid.add(&region, 1, SizerFlag::Expand | cv, 0);
         grid.add(&apply, 0, cv, 0);
@@ -407,6 +496,11 @@ fn build(cfg: Config, resume_background: bool) {
                     h.borrow().update(|c| c.monitor = i as usize);
                 }
             });
+            loaders.push(Box::new(move |c: &Config| {
+                if !names.is_empty() {
+                    mon.set_selection(c.monitor.min(names.len() - 1) as u32);
+                }
+            }));
             grid.add(&label(&bx, "Monitor:"), 0, cv, 0);
             grid.add(&mon, 0, cv, 0);
             grid.add(&label(&bx, ""), 0, cv, 0);
@@ -456,6 +550,7 @@ fn build(cfg: Config, resume_background: bool) {
                 h.borrow().update(|c| c.clock_background = None);
             });
         }
+        loaders.push(Box::new(move |c: &Config| bg_name.set_label(&file_name(&c.clock_background))));
         bg_btns.add(&bg_btn, 0, cv, 0);
         bg_btns.add(&bg_clear, 0, cv | SizerFlag::Left, 4);
         grid.add(&label(&bx, "Background:"), 0, cv, 0);
@@ -489,6 +584,9 @@ fn build(cfg: Config, resume_background: bool) {
                 }
             });
         }
+        loaders.push(Box::new(move |c: &Config| {
+            name.set_label(&file_name(if mode == Mode::Image { &c.image } else { &c.gif }));
+        }));
         grid.add(&label(&bx, what), 0, cv, 0);
         grid.add(&name, 0, cv, 0);
         grid.add(&btn, 0, cv, 0);
@@ -576,6 +674,11 @@ fn build(cfg: Config, resume_background: bool) {
                 h.borrow().update(|c| c.video_loop = on);
             });
         }
+        loaders.push(Box::new(move |c: &Config| {
+            video_name.set_label(&file_name(&c.video));
+            video_sound.set_value(c.video_sound);
+            video_loop.set_value(c.video_loop);
+        }));
         let video_opts = BoxSizer::builder(Orientation::Horizontal).build();
         video_opts.add(&video_sound, 0, cv, 0);
         video_opts.add(&video_loop, 0, cv | SizerFlag::Left, 16);
@@ -589,8 +692,9 @@ fn build(cfg: Config, resume_background: bool) {
     #[cfg(feature = "youtube")]
     {
         let p = Panel::builder(&book).build();
-        let (sb, refresh) = crate::gui_youtube::build(&p, frame, &handle, &cfg);
+        let (sb, refresh, load) = crate::gui_youtube::build(&p, frame, &handle, &cfg);
         refreshers.push(refresh);
+        loaders.push(load);
         pages.push((Mode::YouTube, finish_page(p, sb, None)));
     }
 
@@ -661,6 +765,10 @@ fn build(cfg: Config, resume_background: bool) {
             }
         });
     }
+    loaders.push(Box::new(move |c: &Config| {
+        rotation.set_selection(ROTATIONS.iter().position(|r| *r == c.rotation).unwrap_or(0) as u32);
+        fit.set_selection(Scaling::ALL.iter().position(|f| *f == c.fit).unwrap_or(0) as u32);
+    }));
     let fit_row = BoxSizer::builder(Orientation::Horizontal).build();
     fit_row.add(&label(&op, "Scaling:"), 0, cv | SizerFlag::Right, 6);
     fit_row.add(&fit, 0, cv, 0);
@@ -685,6 +793,12 @@ fn build(cfg: Config, resume_background: bool) {
             }
         });
     }
+    {
+        let levels: Vec<u8> = (MIN_BRIGHTNESS..=100).rev().step_by(10).collect();
+        loaders.push(Box::new(move |c: &Config| {
+            bright.set_selection(levels.iter().position(|l| *l <= c.brightness).unwrap_or(0) as u32);
+        }));
+    }
     grid.add(&label(&op, "Brightness:"), 0, cv, 0);
     grid.add(&bright, 0, cv, 0);
     grid.add(&label(&op, ""), 0, cv, 0);
@@ -704,10 +818,10 @@ fn build(cfg: Config, resume_background: bool) {
          the window stays hidden until you click the icon.",
     );
     {
-        let (h, cb) = (handle.clone(), start_min);
+        let (fa, cb) = (for_all.clone(), start_min);
         start_min.on_toggled(move |_| {
             let on = cb.get_value();
-            h.borrow().update(|c| c.start_minimized = on);
+            fa(&|c: &mut Config| c.start_minimized = on);
         });
     }
     grid.add(&label(&op, "Window icon in:"), 0, cv, 0);
@@ -729,6 +843,7 @@ fn build(cfg: Config, resume_background: bool) {
             }
         });
     }
+    loaders.push(Box::new(move |c: &Config| touch_summary.set_label(&touch_modes_summary(&c.button_modes))));
     grid.add(&label(&op, "Touch button (hold):"), 0, cv, 0);
     grid.add(&touch_summary, 0, cv, 0);
     grid.add(&touch_btn, 0, cv, 0);
@@ -856,11 +971,11 @@ fn build(cfg: Config, resume_background: bool) {
         *tray.borrow_mut() = Some(Tray::new(cfg.mode, on_tray.clone()));
     }
     {
-        let (h, tray, f) = (handle.clone(), tray.clone(), frame);
+        let (h, fa, tray, f) = (handle.clone(), for_all.clone(), tray.clone(), frame);
         tray_choice.on_selection_changed(move |e| {
             let Some(i) = e.get_selection() else { return };
             let t = TrayIcon::ALL[i as usize];
-            h.borrow().update(|c| c.tray_icon = t);
+            fa(&|c: &mut Config| c.tray_icon = t);
             let mut tr = tray.borrow_mut();
             if t.in_tray() && tr.is_none() {
                 *tr = Some(Tray::new(h.borrow().cfg.lock().unwrap().mode, on_tray.clone()));
@@ -870,6 +985,27 @@ fn build(cfg: Config, resume_background: bool) {
                 }
                 f.show(true);
             }
+        });
+    }
+
+    // -- another display chosen: its controller goes to `handle`, the controls show it -------
+    {
+        let (h, parked, active, f) = (handle.clone(), parked.clone(), active.clone(), frame);
+        display_choice.on_selection_changed(move |e| {
+            let Some(j) = e.get_selection() else { return };
+            let (j, old) = (j as usize, active.get());
+            if j == old {
+                return;
+            }
+            let Some(new) = parked.borrow_mut().get_mut(j).and_then(Option::take) else { return };
+            let previous = std::mem::replace(&mut *h.borrow_mut(), new);
+            parked.borrow_mut()[old] = Some(previous);
+            active.set(j);
+            let c = h.borrow().cfg.lock().unwrap().clone();
+            for load in &loaders {
+                load(&c);
+            }
+            f.layout();
         });
     }
 
@@ -957,13 +1093,16 @@ fn build(cfg: Config, resume_background: bool) {
     timer.start(250, false);
 
     {
-        let (h, t, tray) = (handle.clone(), timer.clone(), tray.clone());
+        let (h, parked, t, tray) = (handle.clone(), parked.clone(), timer.clone(), tray.clone());
         frame.on_close(move |e| {
             t.stop();
             if let Some(tr) = tray.borrow_mut().take() {
                 tr.remove();
             }
             h.borrow_mut().stop();
+            for p in parked.borrow_mut().iter_mut().flatten() {
+                p.stop();
+            }
             if resume_background {
                 restart_background();
             }

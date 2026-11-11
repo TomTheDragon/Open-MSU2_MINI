@@ -14,6 +14,10 @@ use sysinfo::{Components, Disks, Gpus, Networks, ProcessesToUpdate, System};
 
 const HISTORY: usize = 160;
 
+/// Rates (network, disk I/O) have no fixed maximum: their bars and histograms are scaled to
+/// the highest rate in the history, but at least this (bytes/s), so idle noise stays small
+const MIN_RATE_SCALE: f32 = 64.0 * 1024.0;
+
 #[derive(Default, Clone, Copy)]
 struct GpuInfo {
     usage: Option<f32>,
@@ -38,6 +42,8 @@ struct Row {
     frac: Option<f32>,
     /// several small bars (CPU cores)
     multi: Option<Vec<f32>>,
+    /// bytes/s of a rate (network, disk I/O); its graphic is scaled to the recent peak
+    rate: Option<f32>,
 }
 
 pub struct StatsScreen {
@@ -59,6 +65,8 @@ pub struct StatsScreen {
     started: Instant,
     /// by row position: disk values can be shown more than once
     history: HashMap<usize, VecDeque<f32>>,
+    /// like `history`, for rates: bytes/s (scaled when drawn, as the peak changes)
+    rates: HashMap<usize, VecDeque<f32>>,
 }
 
 impl StatsScreen {
@@ -89,6 +97,7 @@ impl StatsScreen {
             last: Instant::now(),
             started: Instant::now(),
             history: HashMap::new(),
+            rates: HashMap::new(),
         }
     }
 
@@ -204,7 +213,8 @@ impl StatsScreen {
         let mut rows = Vec::new();
         for (index, entry) in items.into_iter().enumerate() {
             let item = entry.item;
-            let mut row = Row { item, label: entry.short(), index, value: "n/a".into(), frac: None, multi: None };
+            let mut row =
+                Row { item, label: entry.short(), index, value: "n/a".into(), frac: None, multi: None, rate: None };
             match item {
                 StatItem::Cpu => {
                     let u = self.cpu_usage();
@@ -286,12 +296,14 @@ impl StatsScreen {
                             .iter()
                             .fold((0u64, 0u64), |a, d| (a.0 + d.usage().read_bytes, a.1 + d.usage().written_bytes));
                         row.value = format!("R{} W{}", fmt_rate(r as f64 / dt), fmt_rate(w as f64 / dt));
+                        row.rate = Some(((r + w) as f64 / dt) as f32);
                     }
                 }
                 StatItem::Net => {
                     let (d, u) =
                         self.nets.iter().fold((0u64, 0u64), |a, (_, n)| (a.0 + n.received(), a.1 + n.transmitted()));
                     row.value = format!("↓{} ↑{}", fmt_rate(d as f64 / dt), fmt_rate(u as f64 / dt));
+                    row.rate = Some(((d + u) as f64 / dt) as f32);
                 }
                 StatItem::Battery => {
                     if let Some((pct, charging)) = battery() {
@@ -318,7 +330,14 @@ impl StatsScreen {
                 }
                 StatItem::Time => row.value = chrono::Local::now().format("%H:%M:%S").to_string(),
             }
-            if let Some(f) = row.frac {
+            if let Some(r) = row.rate {
+                let h = self.rates.entry(index).or_default();
+                h.push_back(r);
+                while h.len() > HISTORY {
+                    h.pop_front();
+                }
+                row.frac = Some(r / rate_peak(h));
+            } else if let Some(f) = row.frac {
                 let h = self.history.entry(index).or_default();
                 h.push_back(f.clamp(0.0, 1.0));
                 while h.len() > HISTORY {
@@ -340,6 +359,15 @@ impl StatsScreen {
             [240, 180, 40]
         } else {
             [240, 70, 60]
+        }
+    }
+
+    /// Colour of a row's graphic: by load, but a rate has no "too high"
+    fn row_color(&self, row: &Row, frac: f32) -> [u8; 3] {
+        if row.rate.is_some() {
+            self.cfg.accent
+        } else {
+            self.color(frac)
         }
     }
 
@@ -379,12 +407,24 @@ impl StatsScreen {
             StatGraphic::Bars => {
                 let fill = (iw as f32 * frac.clamp(0.0, 1.0)) as u32;
                 if fill > 0 {
-                    draw_filled_rect_mut(img, Rect::at(ix, iy).of_size(fill, ih as u32), Rgb(self.color(frac)));
+                    draw_filled_rect_mut(
+                        img,
+                        Rect::at(ix, iy).of_size(fill, ih as u32),
+                        Rgb(self.row_color(row, frac)),
+                    );
                 }
             }
             StatGraphic::Histogram => {
                 draw_filled_rect_mut(img, Rect::at(x, y).of_size(w as u32, h as u32), Rgb([25, 25, 30]));
-                if let Some(hist) = self.history.get(&row.index) {
+                // 0..1 values; rates scaled to the highest one shown
+                let hist: Option<Vec<f32>> = match row.rate {
+                    Some(_) => self.rates.get(&row.index).map(|h| {
+                        let peak = rate_peak(h);
+                        h.iter().map(|v| v / peak).collect()
+                    }),
+                    None => self.history.get(&row.index).map(|h| h.iter().copied().collect()),
+                };
+                if let Some(hist) = hist {
                     let skip = hist.len().saturating_sub(iw as usize);
                     let start = ix + iw - (hist.len() - skip) as i32;
                     for (i, v) in hist.iter().skip(skip).enumerate() {
@@ -392,7 +432,7 @@ impl StatsScreen {
                         draw_filled_rect_mut(
                             img,
                             Rect::at(start + i as i32, iy + ih - bh).of_size(1, bh as u32),
-                            Rgb(self.color(*v)),
+                            Rgb(self.row_color(row, *v)),
                         );
                     }
                 }
@@ -537,6 +577,11 @@ fn fmt_used(used: u64, total: u64) -> String {
         return format!("{}/{}T", f(t(used)), f(t(total)));
     }
     format!("{}/{}G", f(g(used)), f(g(total)))
+}
+
+/// What a rate's graphic is scaled to: the highest rate in the history (at least MIN_RATE_SCALE)
+fn rate_peak(history: &VecDeque<f32>) -> f32 {
+    history.iter().copied().fold(MIN_RATE_SCALE, f32::max)
 }
 
 fn fmt_rate(mut bps: f64) -> String {
@@ -803,6 +848,14 @@ mod tests {
     use super::*;
     use crate::config::StatItem;
     use crate::device::{canvas_size, orient, HEIGHT, WIDTH};
+
+    #[test]
+    fn rates_are_scaled_to_their_peak() {
+        let quiet: VecDeque<f32> = [100.0, 2000.0].into();
+        assert_eq!(rate_peak(&quiet), MIN_RATE_SCALE, "idle noise does not fill the graph");
+        let busy: VecDeque<f32> = [1e6, 4e6, 2e6].into();
+        assert_eq!(rate_peak(&busy), 4e6);
+    }
     use crate::render::{frame_to_rgb, ClockScreen};
 
     /// Renders every value with every graphic, value position and orientation. Set

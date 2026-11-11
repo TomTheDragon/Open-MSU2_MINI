@@ -2,7 +2,7 @@
 
 use crate::config::{Config, Favorite, Mode};
 use crate::controller::{Handle, Media, Status};
-use crate::gui::{play_label, Refresh};
+use crate::gui::{play_label, Load, Refresh};
 use std::cell::RefCell;
 use std::rc::Rc;
 use wxdragon::prelude::*;
@@ -10,7 +10,12 @@ use wxdragon::prelude::*;
 const TITLE: &str = "Open MSU2_MINI";
 
 /// Builds the "YouTube" box.
-pub fn build(panel: &Panel, frame: Frame, handle: &Rc<RefCell<Handle>>, cfg: &Config) -> (StaticBoxSizer, Refresh) {
+pub fn build(
+    panel: &Panel,
+    frame: Frame,
+    handle: &Rc<RefCell<Handle>>,
+    cfg: &Config,
+) -> (StaticBoxSizer, Refresh, Load) {
     let yt_box = StaticBoxSizerBuilder::new_with_label(Orientation::Vertical, panel, "YouTube").build();
     let p = yt_box.get_static_box().unwrap();
     let cv = SizerFlag::AlignCenterVertical;
@@ -162,7 +167,17 @@ pub fn build(panel: &Panel, frame: Frame, handle: &Rc<RefCell<Handle>>, cfg: &Co
     yt_box.add_sizer(&grid, 0, SizerFlag::Expand | SizerFlag::All, 6);
 
     // the touch button can switch the address; the button shows Play or Pause
-    let last_url = RefCell::new(cfg.youtube_url.clone());
+    let last_url = Rc::new(RefCell::new(cfg.youtube_url.clone()));
+    // another display chosen: its address, sound and favourites
+    let load: Load = {
+        let (last_url, fill) = (last_url.clone(), fill.clone());
+        Box::new(move |c: &Config| {
+            *last_url.borrow_mut() = c.youtube_url.clone();
+            url.set_value(c.youtube_url.as_deref().unwrap_or_default());
+            sound.set_value(c.youtube_sound);
+            fill(c.youtube_url.as_deref());
+        })
+    };
     let refresh: Refresh = Rc::new(move |s: &Status, c: &Config| {
         if *last_url.borrow() != c.youtube_url {
             *last_url.borrow_mut() = c.youtube_url.clone();
@@ -174,7 +189,7 @@ pub fn build(panel: &Panel, frame: Frame, handle: &Rc<RefCell<Handle>>, cfg: &Co
             play.set_label(l);
         }
     });
-    (yt_box, refresh)
+    (yt_box, refresh, load)
 }
 
 fn warn(frame: &Frame, msg: &str) {

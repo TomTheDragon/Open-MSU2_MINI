@@ -105,6 +105,9 @@ pub struct Config {
     pub tray_icon: TrayIcon,
     /// Open the control window minimized (or only in the notification area)
     pub start_minimized: bool,
+    /// Which display these settings belong to (0 = the first, saved in config.json)
+    #[serde(skip)]
+    pub display: usize,
 }
 
 impl Default for Config {
@@ -136,6 +139,7 @@ impl Default for Config {
             stats: StatsConfig::default(),
             tray_icon: TrayIcon::Taskbar,
             start_minimized: false,
+            display: 0,
         }
     }
 }
@@ -542,14 +546,56 @@ pub fn config_dir() -> PathBuf {
     dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("open-msu2-mini")
 }
 
-fn config_file() -> PathBuf {
-    config_dir().join("config.json")
+/// Most displays (screens) driven at the same time
+pub const MAX_DISPLAYS: usize = 16;
+
+/// Settings of a display: config.json for the first, display2.json, display3.json, ... for the others
+fn config_file(display: usize) -> PathBuf {
+    match display {
+        0 => config_dir().join("config.json"),
+        n => config_dir().join(format!("display{}.json", n + 1)),
+    }
 }
 
 impl Config {
+    /// Settings of the first display
     pub fn load() -> Config {
-        let mut c: Config =
-            std::fs::read_to_string(config_file()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        Self::load_display(0)
+    }
+
+    /// Settings of every display: the saved ones, plus new ones up to `at_least` (e.g. the
+    /// number of screens connected). New ones are saved once something is changed.
+    pub fn load_displays(at_least: usize) -> Vec<Config> {
+        let saved = (1..MAX_DISPLAYS).filter(|i| config_file(*i).exists()).max().map_or(1, |i| i + 1);
+        let mut list = vec![Self::load_display(0)];
+        for i in 1..saved.max(at_least).min(MAX_DISPLAYS) {
+            // one in between may never have been changed (and saved)
+            let c = if config_file(i).exists() { Self::load_display(i) } else { Self::new_display(&list[0], i) };
+            list.push(c);
+        }
+        list
+    }
+
+    /// Settings for another display. The window settings are shared by all displays; the
+    /// mode is the clock (screen mirroring would ask again which screen to share).
+    pub fn new_display(first: &Config, display: usize) -> Config {
+        Config {
+            display,
+            mode: Mode::Clock,
+            tray_icon: first.tray_icon,
+            start_minimized: first.start_minimized,
+            youtube_favorites: first.youtube_favorites.clone(),
+            stats: first.stats.clone(),
+            ..Default::default()
+        }
+    }
+
+    fn load_display(display: usize) -> Config {
+        let mut c: Config = std::fs::read_to_string(config_file(display))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        c.display = display;
         if c.flipped {
             c.rotation = 180;
             c.flipped = false;
@@ -611,7 +657,7 @@ impl Config {
     pub fn save(&self) {
         let _ = std::fs::create_dir_all(config_dir());
         if let Ok(s) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(config_file(), s);
+            let _ = std::fs::write(config_file(self.display), s);
         }
     }
 }
@@ -688,6 +734,25 @@ pub fn kill_background(pid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_display_has_its_own_settings_file() {
+        assert!(config_file(0).ends_with("config.json"));
+        assert!(config_file(1).ends_with("display2.json"));
+        let first = Config {
+            tray_icon: TrayIcon::Tray,
+            mode: Mode::Mirror,
+            port: Some("/dev/ttyACM0".into()),
+            ..Default::default()
+        };
+        let second = Config::new_display(&first, 1);
+        assert_eq!(second.display, 1);
+        assert_eq!(second.tray_icon, TrayIcon::Tray, "window settings are shared");
+        assert_eq!(second.port, None, "a new display takes any free screen");
+        assert_eq!(second.mode, Mode::Clock);
+        // the display number is not stored in the file
+        assert!(!serde_json::to_string(&second).unwrap().contains("\"display\""));
+    }
 
     #[test]
     fn stat_rows_with_drives_load_and_save() {

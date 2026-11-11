@@ -112,9 +112,13 @@ enum Cmd {
         #[arg(long, hide = true)]
         plugged: bool,
     },
-    /// Run without a window, using the saved settings (options override them)
+    /// Run without a window, using the saved settings (options override them); drives all
+    /// connected screens
     Run {
         mode: Option<ModeArg>,
+        /// Which screen the other options are for, when several are connected (1 = the first)
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=16))]
+        display: u8,
         #[arg(long)]
         fit: Option<FitArg>,
         /// Mirror only part of the screen: X,Y,W,H
@@ -263,6 +267,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Run {
             mode,
+            display,
             fit,
             region,
             full,
@@ -284,7 +289,9 @@ fn run(cli: Cli) -> Result<()> {
             no_button,
             save,
         } => {
-            let mut cfg = Config::load();
+            let display = display as usize - 1;
+            let mut displays = Config::load_displays(device::count_screens().max(display + 1));
+            let mut cfg = displays.remove(display);
             if let Some(p) = cli.port {
                 cfg.port = Some(p);
                 cfg.device_serial = None;
@@ -382,20 +389,30 @@ fn run(cli: Cli) -> Result<()> {
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let s2 = stop.clone();
             let _ = ctrlc_handler(move || s2.store(true, std::sync::atomic::Ordering::SeqCst));
-            let mut last = String::new();
-            let mut h = controller::spawn(cfg, !no_button, |_| {});
+            displays.insert(display, cfg);
+            let several = displays.len() > 1;
+            let mut handles: Vec<_> = displays.into_iter().map(|c| controller::spawn(c, !no_button, |_| {})).collect();
             if reselect {
-                h.reselect_screen();
+                handles[display].reselect_screen();
             }
-            while !stop.load(std::sync::atomic::Ordering::SeqCst) && h.is_running() {
+            let mut last = vec![String::new(); handles.len()];
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) && handles.iter().any(|h| h.is_running()) {
                 std::thread::sleep(Duration::from_millis(200));
-                let s = h.status.lock().unwrap().clone();
-                if s.text != last {
-                    println!("{}", s.text);
-                    last = s.text;
+                for (h, last) in handles.iter().zip(last.iter_mut()) {
+                    let s = h.status.lock().unwrap().clone();
+                    if s.text != *last {
+                        if several {
+                            println!("display {}: {}", h.display + 1, s.text);
+                        } else {
+                            println!("{}", s.text);
+                        }
+                        *last = s.text;
+                    }
                 }
             }
-            h.stop();
+            for h in &mut handles {
+                h.stop();
+            }
             config::remove_pid();
             Ok(())
         }

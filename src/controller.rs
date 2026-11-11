@@ -10,6 +10,7 @@ use crate::stats::StatsScreen;
 use crate::video::{Playback, VideoScreen};
 #[cfg(feature = "youtube")]
 use crate::youtube::YouTubeScreen;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc;
@@ -47,7 +48,51 @@ const MEDIA_NONE: u8 = 0;
 const MEDIA_PLAY_PAUSE: u8 = 1;
 const MEDIA_STOP: u8 = 2;
 
+// -- several displays ---------------------------------------------------------------
+// Each display (screen) has its own controller. A display set to "automatic" takes the first
+// screen no other display has chosen or holds open.
+
+#[derive(Default)]
+struct PortUse {
+    /// Port chosen in the display's settings (None = automatic)
+    chosen: Option<String>,
+    /// Port the display holds open
+    open: Option<String>,
+}
+
+static PORTS: Mutex<BTreeMap<usize, PortUse>> = Mutex::new(BTreeMap::new());
+
+/// Displays open their screen one at a time, so two automatic ones never take the same
+static OPENING: Mutex<()> = Mutex::new(());
+
+fn note_port(display: usize, f: impl FnOnce(&mut PortUse)) {
+    f(PORTS.lock().unwrap().entry(display).or_default());
+}
+
+/// Ports the other displays have chosen or hold open
+fn ports_of_others(display: usize) -> Vec<String> {
+    let ports = PORTS.lock().unwrap();
+    ports
+        .iter()
+        .filter(|(d, _)| **d != display)
+        .flat_map(|(_, u)| [u.chosen.clone(), u.open.clone()])
+        .flatten()
+        .collect()
+}
+
+/// Another display has chosen this port (an automatic display then gives it up)
+fn chosen_by_other(display: usize, port: &str) -> bool {
+    PORTS.lock().unwrap().iter().any(|(d, u)| *d != display && u.chosen.as_deref() == Some(port))
+}
+
+/// The display (0 = the first) that holds this port open, if any
+pub fn display_using(port: &str) -> Option<usize> {
+    PORTS.lock().unwrap().iter().find(|(_, u)| u.open.as_deref() == Some(port)).map(|(d, _)| *d)
+}
+
 pub struct Handle {
+    /// Which display this controller drives (0 = the first)
+    pub display: usize,
     pub cfg: Arc<Mutex<Config>>,
     pub status: Arc<Mutex<Status>>,
     changed: Arc<AtomicBool>,
@@ -78,6 +123,7 @@ impl Handle {
     }
     /// Use another device (None = the first one found); connects to it right away.
     pub fn set_device(&self, port: Option<String>, serial: Option<String>) {
+        note_port(self.display, |u| u.chosen = port.clone());
         self.reconnect.store(true, Ordering::SeqCst);
         self.update(|c| {
             c.port = port;
@@ -120,6 +166,7 @@ impl Handle {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(t) = self.thread.take() {
             let _ = t.join();
+            PORTS.lock().unwrap().remove(&self.display);
         }
     }
     pub fn is_running(&self) -> bool {
@@ -134,6 +181,9 @@ impl Drop for Handle {
 }
 
 pub fn spawn(cfg: Config, use_button: bool, on_status: impl Fn(&Status) + Send + 'static) -> Handle {
+    // noted before the thread starts, so an automatic display started next leaves it alone
+    let display = cfg.display;
+    note_port(display, |u| *u = PortUse { chosen: cfg.port.clone(), open: None });
     let cfg = Arc::new(Mutex::new(cfg));
     let status = Arc::new(Mutex::new(Status::default()));
     let changed = Arc::new(AtomicBool::new(true));
@@ -145,6 +195,7 @@ pub fn spawn(cfg: Config, use_button: bool, on_status: impl Fn(&Status) + Send +
     let media_cmd = Arc::new(AtomicU8::new(MEDIA_NONE));
     let (tx, rx) = mpsc::channel();
     let mut c = Controller {
+        display,
         cfg: cfg.clone(),
         status: status.clone(),
         changed: changed.clone(),
@@ -177,8 +228,10 @@ pub fn spawn(cfg: Config, use_button: bool, on_status: impl Fn(&Status) + Send +
         meter: Meter::default(),
         dimmer: None,
     };
-    let thread = std::thread::Builder::new().name("controller".into()).spawn(move || c.run()).unwrap();
+    let name = format!("controller {}", display + 1);
+    let thread = std::thread::Builder::new().name(name).spawn(move || c.run()).unwrap();
     Handle {
+        display,
         cfg,
         status,
         changed,
@@ -201,6 +254,7 @@ struct Meter {
 }
 
 struct Controller {
+    display: usize,
     cfg: Arc<Mutex<Config>>,
     status: Arc<Mutex<Status>>,
     changed: Arc<AtomicBool>,
@@ -329,6 +383,7 @@ impl Controller {
         while !self.stop.load(Ordering::SeqCst) {
             if let Err(e) = self.tick() {
                 if self.dev.take().is_some() {
+                    note_port(self.display, |u| u.open = None);
                     self.device_lost();
                 }
                 self.shown = None;
@@ -368,9 +423,15 @@ impl Controller {
     }
 
     fn tick(&mut self) -> anyhow::Result<()> {
+        // automatic: give the screen up when another display was set to it
+        let automatic = self.cfg.lock().unwrap().port.is_none();
+        if automatic && self.dev.as_ref().is_some_and(|d| chosen_by_other(self.display, &d.port_name)) {
+            self.reconnect.store(true, Ordering::SeqCst);
+        }
         if self.reconnect.swap(false, Ordering::SeqCst) {
             if let Some(mut d) = self.dev.take() {
                 let _ = d.flush();
+                note_port(self.display, |u| u.open = None);
             }
             self.shown = None;
         }
@@ -379,7 +440,13 @@ impl Controller {
                 let c = self.cfg.lock().unwrap();
                 (c.port.clone(), c.device_serial.clone())
             };
-            let d = Device::open_chosen(port.as_deref(), serial.as_deref())?;
+            let d = {
+                let _one_at_a_time = OPENING.lock().unwrap_or_else(|e| e.into_inner());
+                let avoid = ports_of_others(self.display);
+                let d = Device::open_avoiding(port.as_deref(), serial.as_deref(), &avoid)?;
+                note_port(self.display, |u| u.open = Some(d.port_name.clone()));
+                d
+            };
             let text = format!(
                 "connected ({}, firmware v{})",
                 d.port_name,
@@ -825,6 +892,25 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_displays_leave_the_others_screens_alone() {
+        // display numbers no other test uses (the registry is shared)
+        let (a, b, c) = (100, 101, 102);
+        note_port(a, |u| u.chosen = Some("/dev/ttyACM1".into()));
+        note_port(b, |u| u.open = Some("/dev/ttyACM0".into()));
+        note_port(c, |_| {});
+        let mut others = ports_of_others(c);
+        others.retain(|p| p.starts_with("/dev/ttyACM"));
+        others.sort();
+        assert_eq!(others, ["/dev/ttyACM0", "/dev/ttyACM1"]);
+        assert!(chosen_by_other(c, "/dev/ttyACM1"));
+        assert!(!chosen_by_other(a, "/dev/ttyACM1"), "its own choice");
+        assert_eq!(display_using("/dev/ttyACM0"), Some(b));
+        for d in [a, b, c] {
+            PORTS.lock().unwrap().remove(&d);
+        }
+    }
 
     #[test]
     fn double_tap_steps_through_youtube_addresses() {

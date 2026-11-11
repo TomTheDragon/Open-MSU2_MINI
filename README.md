@@ -39,7 +39,9 @@ It replaces the vendor's Windows-only demo tool and runs on **Linux, Windows and
 - **Native window** that follows your desktop theme: GTK on Linux, Win32 with dark mode on
   Windows, Cocoa on macOS. Optionally with an icon in the notification area (system tray)
   and started minimized.
-- **Several screens connected?** Choose which one to use from the device list.
+- **Several screens at once**: each connected screen is a display with its own settings
+  (mode, picture, rotation, ...), and all of them run at the same time. Choose the display to
+  change at the top of the window.
 - **Command line** for running without a window (autostart), flashing and benchmarking.
 
 ![System monitor (bars and history graphs) and clock in landscape](docs/screens-landscape.png)
@@ -140,6 +142,7 @@ open-msu2-mini run --gif cat.gif --brightness 50   # GIF mode at half brightness
 open-msu2-mini run --video clip.mp4 --sound --loop=false   # play once, with sound
 open-msu2-mini run --youtube https://www.youtube.com/@LofiGirl/live --sound   # a YouTube live stream
 open-msu2-mini run --youtube "Lofi"     # a YouTube favourite, by its name
+open-msu2-mini run clock --display 2    # several screens: all run, the options are for the second
 open-msu2-mini run mirror --region 0,0,1280,640 --fps 60
 open-msu2-mini run stats --rotate 90    # rotation: 0, 90, 180 or 270 (works with run/show/flash)
 open-msu2-mini run mirror --fps 0.5     # slowest: one picture every two seconds
