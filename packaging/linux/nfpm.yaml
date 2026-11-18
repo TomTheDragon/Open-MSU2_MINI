@@ -1,6 +1,6 @@
 # Linux packages (deb, rpm, Arch) from the release executable; see build/package.sh.
 name: open-msu2-mini
-arch: amd64
+arch: ${PKG_ARCH} # amd64 or arm64, set by build/package.sh
 platform: linux
 version: ${VERSION}
 release: 1

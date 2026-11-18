@@ -62,8 +62,8 @@ Download the executable for your system from the
 
 | System | Notes |
 |---|---|
-| **Linux** x86_64 | Packages for Ubuntu/Debian, Fedora/openSUSE and Arch, or a single executable; see [Linux](#linux) below. |
-| **Windows** 10/11 | Just run the `.exe`; no driver needed. For videos install [ffmpeg](https://ffmpeg.org): `winget install Gyan.FFmpeg` (or put `ffmpeg.exe` next to the program). For YouTube also `winget install yt-dlp.yt-dlp`. |
+| **Linux** x86_64, ARM64 | Packages for Ubuntu/Debian, Fedora/openSUSE and Arch, or a single executable; see [Linux](#linux) below. |
+| **Windows** 10/11 (x86_64, ARM64) | Just run the `.exe` (`-x86_64` or `-arm64`); no driver needed. For videos install [ffmpeg](https://ffmpeg.org): `winget install Gyan.FFmpeg` (or put `ffmpeg.exe` next to the program). For YouTube also `winget install yt-dlp.yt-dlp`. |
 | **macOS** | Allow "Screen Recording" for the app (or your terminal) to mirror the screen. Videos in formats other than MP4/H.264 need ffmpeg (`brew install ffmpeg`); YouTube needs ffmpeg and yt-dlp (`brew install ffmpeg yt-dlp`). |
 
 ### Linux
@@ -82,18 +82,18 @@ if it was connected during the installation).
 
 | Distribution | Package | Install |
 |---|---|---|
-| **Ubuntu** 24.04+, **Debian** 13+, Linux Mint 22+, Pop!_OS 24.04+ | `.deb` | `sudo apt install ./open-msu2-mini_*_amd64.deb` |
-| **Fedora** 41+ | `.rpm` | `sudo dnf install ./open-msu2-mini-*.x86_64.rpm ffmpeg-free` |
-| **openSUSE** Tumbleweed | `.rpm` (the same file) | `sudo zypper install --allow-unsigned-rpm ./open-msu2-mini-*.x86_64.rpm` |
+| **Ubuntu** 24.04+, **Debian** 13+, Linux Mint 22+, Pop!_OS 24.04+ | `.deb` | `sudo apt install ./open-msu2-mini_*_amd64.deb` (ARM: `_arm64.deb`) |
+| **Fedora** 41+ | `.rpm` | `sudo dnf install ./open-msu2-mini-*.x86_64.rpm ffmpeg-free` (ARM: `.aarch64.rpm`) |
+| **openSUSE** Tumbleweed | `.rpm` (the same file) | `sudo zypper install --allow-unsigned-rpm ./open-msu2-mini-*.x86_64.rpm` (ARM: `.aarch64.rpm`) |
 | **Arch**, Manjaro, EndeavourOS | `.pkg.tar.zst` | `sudo pacman -U open-msu2-mini-*.pkg.tar.zst && sudo pacman -S --needed ffmpeg` |
-| Any other (glibc 2.39+) | `.AppImage` | `chmod +x open-msu2-mini-*-x86_64.AppImage`, then start it |
+| Any other (glibc 2.39+) | `.AppImage` | `chmod +x open-msu2-mini-*-x86_64.AppImage` (ARM: `-aarch64`), then start it |
 
 The **AppImage** brings the tray-icon libraries and libSM along, and uses GTK 3, PipeWire,
 ALSA and ffmpeg from the system. It does not install the udev rule; see *Device access*
 below.
 
-**Single executable.** Alternatively download `open-msu2-mini-linux-x86_64` and install the
-libraries yourself (most are already there on a desktop system):
+**Single executable.** Alternatively download `open-msu2-mini-linux-x86_64` (ARM:
+`open-msu2-mini-linux-arm64`) and install the libraries yourself (most are already there on a desktop system):
 
 | Distribution | Command |
 |---|---|
@@ -284,8 +284,9 @@ build/package.sh     # only the packages, from dist/open-msu2-mini-linux-x86_64 
 MSU2_APPIMAGE=1 build/package.sh   # also the AppImage (downloads appimagetool; CI always builds it)
 ```
 
-GitHub Actions (`.github/workflows/ci.yml`) builds Linux, Windows and macOS (Intel and
-Apple Silicon) on every push. A `v*` tag publishes the executables as a release.
+GitHub Actions (`.github/workflows/ci.yml`) builds Linux and Windows (x86_64 and ARM64) and
+macOS (Intel and Apple Silicon) on every push, on native runners. A `v*` tag publishes the
+executables as a release.
 
 ### Project layout
 

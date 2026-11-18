@@ -1,9 +1,16 @@
 #!/bin/sh
 # Build Linux packages (.deb, .rpm, Arch .pkg.tar.zst, AppImage) into dist/ from the Linux executable.
 # Usage: build/package.sh [BINARY]   (default: dist/open-msu2-mini-linux-x86_64; needs Docker)
+# The architecture (x86_64 or arm64/aarch64) is read from the executable.
 set -e
 cd "$(dirname "$0")/.."
 BINARY=${1:-dist/open-msu2-mini-linux-x86_64}
+case "$(file -b "$BINARY")" in
+    *x86-64*) ARCH=x86_64 PKG_ARCH=amd64 ;;
+    *aarch64*) ARCH=aarch64 PKG_ARCH=arm64 ;;
+    *) echo "unknown architecture: $(file -b "$BINARY")" >&2; exit 1 ;;
+esac
+export ARCH
 VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 STAGE=target/package
 mkdir -p "$STAGE" dist
@@ -14,7 +21,7 @@ sed 's#@BIN@#/usr/bin/open-msu2-mini#' packaging/linux/open-msu2-mini-plugged.se
     > "$STAGE/open-msu2-mini-plugged.service"
 for p in deb rpm archlinux; do
     docker run --rm -u "$(id -u):$(id -g)" -v "$PWD":/src -w /src \
-        -e VERSION="$VERSION" \
+        -e VERSION="$VERSION" -e PKG_ARCH="$PKG_ARCH" \
         goreleaser/nfpm:v2.48.0 package --config packaging/linux/nfpm.yaml --packager "$p" --target dist/
 done
 # AppImage: built in CI; locally only with MSU2_APPIMAGE=1, because it downloads and runs
@@ -23,7 +30,7 @@ done
 if [ -z "$CI" ] && [ -z "$MSU2_APPIMAGE" ]; then
     echo "AppImage skipped (built in CI; set MSU2_APPIMAGE=1 to build it here)"
 elif docker image inspect "${MSU2_IMAGE:-open-msu2-build}" >/dev/null 2>&1; then
-    docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD":/src -w /src "${MSU2_IMAGE:-open-msu2-build}" \
+    docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -e ARCH="$ARCH" -v "$PWD":/src -w /src "${MSU2_IMAGE:-open-msu2-build}" \
         build/appimage.sh "$BINARY" "$VERSION"
 else
     build/appimage.sh "$BINARY" "$VERSION"

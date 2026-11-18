@@ -14,7 +14,9 @@ jobs:
       matrix:
         include:
           - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu, file: open-msu2-mini, asset: open-msu2-mini-linux-x86_64 }
-          - { os: windows-latest, target: x86_64-pc-windows-msvc, file: open-msu2-mini.exe, asset: open-msu2-mini-windows-x86_64.exe }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, file: open-msu2-mini, asset: open-msu2-mini-linux-arm64 }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, file: open-msu2-mini.exe, asset: open-msu2-mini-windows-x86_64.exe, msvc: amd64 }
+          - { os: windows-11-arm, target: aarch64-pc-windows-msvc, file: open-msu2-mini.exe, asset: open-msu2-mini-windows-arm64.exe, msvc: arm64 }
           - { os: macos-15, target: aarch64-apple-darwin, file: open-msu2-mini, asset: open-msu2-mini-macos-arm64 }
           - { os: macos-15-intel, target: x86_64-apple-darwin, file: open-msu2-mini, asset: open-msu2-mini-macos-x86_64 }
     runs-on: ${{ matrix.os }}
@@ -38,13 +40,15 @@ jobs:
       - name: Windows build tools
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc }}
       - name: Windows packages
         if: runner.os == 'Windows'
         run: choco install ninja -y
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
       - name: Check the optional parts (without video and YouTube, without the window)
-        if: runner.os == 'Linux'
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
           cargo check --release --target ${{ matrix.target }} --no-default-features --features gui
           cargo check --release --target ${{ matrix.target }} --no-default-features --features youtube
@@ -61,7 +65,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: runner.os == 'Linux'
         with:
-          name: linux-packages
+          name: linux-packages-${{ matrix.target }}
           path: |
             dist/*.deb
             dist/*.rpm
